@@ -64,7 +64,7 @@ with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
             zi = zipfile.ZipInfo(arc, date_time=(2026, 1, 1, 0, 0, 0))
             zi.external_attr = (0o100755 if f == binary else 0o100644) << 16
             zi.compress_type = zipfile.ZIP_DEFLATED
-            z.write(f, arc)
+            z.writestr(zi, f.read_bytes())
 
 shutil.rmtree(work, ignore_errors=True)
 print(f"OK: {out} ({out.stat().st_size // 1024} KB)")
