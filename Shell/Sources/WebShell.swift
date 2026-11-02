@@ -91,7 +91,7 @@ final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptM
     func webView(_ webView: WKWebView,
                  decidePolicyFor navigationAction: WKNavigationAction,
                  decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
-        guard let url = navigationAction.url else { decisionHandler(.cancel); return }
+        guard let url = navigationAction.request.url else { decisionHandler(.cancel); return }
 
         // iframes (embeds, players) always load — never navigate away
         if navigationAction.targetFrame?.isMainFrame != true {
@@ -114,7 +114,7 @@ final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptM
                  createWebViewWith configuration: WKWebViewConfiguration,
                  for navigationAction: WKNavigationAction,
                  windowFeatures: WKWindowFeatures) -> WKWebView? {
-        if let url = navigationAction.url { UIApplication.shared.open(url) }
+        if let url = navigationAction.request.url { UIApplication.shared.open(url) }
         return nil
     }
 
