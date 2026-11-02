@@ -3,7 +3,7 @@
 
 100% LOCAL — your URL / app name / icon never leave this PC.
 Usage:  python tools/inject_identity.py [Shell-unsigned.ipa]
-Output: dist/Aurorix-unsigned.ipa  (then sign at signer.esign-ios.com)
+Output: dist/<AppName>-unsigned.ipa  (then sign at signer.esign-ios.com)
 """
 import json, plistlib, shutil, sys, zipfile
 from pathlib import Path
