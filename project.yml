@@ -1,6 +1,6 @@
-name: Aurorix
+name: Shell
 options:
-  bundleIdPrefix: org.imfan
+  bundleIdPrefix: com.webshell
   deploymentTarget:
     iOS: "15.0"
   createIntermediateGroups: true
@@ -16,31 +16,23 @@ settings:
     CODE_SIGNING_REQUIRED: "NO"
     CODE_SIGNING_ALLOWED: "NO"
 
+# 100% GENERIC — no name, no URL, no icon of any specific product here.
+# Identity is injected into the built .app AFTER download (tools/inject_identity.py).
 targets:
-  Aurorix:
+  Shell:
     type: application
     platform: iOS
     sources:
-      - path: Aurorix/Sources
-      - path: Aurorix/Resources
+      - path: Shell/Sources
     info:
-      path: Aurorix/SupportFiles/Info.plist
+      path: Shell/SupportFiles/Info.plist
       properties:
-        CFBundleDisplayName: Aurorix
         CFBundleShortVersionString: $(MARKETING_VERSION)
         CFBundleVersion: $(CURRENT_PROJECT_VERSION)
-        UILaunchScreen:
-          UIColorName: LaunchBG
-        UIStatusBarStyle: UIStatusBarStyleLightContent
-        UIViewControllerBasedStatusBarAppearance: false
+        UILaunchScreen: {}
+        UIRequiresFullScreen: false
+        ITSAppUsesNonExemptEncryption: false
         UISupportedInterfaceOrientations~iphone:
           - UIInterfaceOrientationPortrait
           - UIInterfaceOrientationLandscapeLeft
           - UIInterfaceOrientationLandscapeRight
-        UISupportedInterfaceOrientations~ipad:
-          - UIInterfaceOrientationPortrait
-          - UIInterfaceOrientationPortraitUpsideDown
-          - UIInterfaceOrientationLandscapeLeft
-          - UIInterfaceOrientationLandscapeRight
-        UIRequiresFullScreen: false
-        ITSAppUsesNonExemptEncryption: false

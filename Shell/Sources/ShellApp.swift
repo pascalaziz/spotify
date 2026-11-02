@@ -1,10 +1,10 @@
 import SwiftUI
 
 @main
-struct AurorixApp: App {
+struct ShellApp: App {
     var body: some Scene {
         WindowGroup {
-            WebShell()
+            ShellView()
                 .ignoresSafeArea()
         }
     }

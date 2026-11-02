@@ -1,52 +1,43 @@
-# Aurorix iOS shell (spotifyAPP)
+# Web Shell → iOS IPA (private-identity pipeline)
 
-Thin native WKWebView shell around the existing Aurorix PWA (`C:\Users\Admin\Music\spotify\aurorix`).
-The app IS the PWA — no new UI, no server work ('already' rule: everything inside is Aurorix itself).
-Binary is ~1–2 MB. Built UNSIGNED by a free GitHub Actions macOS runner (no Mac, no $99 account).
+Generic WKWebView shell compiled to an **unsigned IPA** by a free GitHub Actions
+macOS runner — with **zero product files on GitHub**.
 
-## The only lines you ever touch
+## How the privacy split works
 
-- **URL** → `Aurorix/Sources/WebShell.swift`, top:
-  `let APP_URL = URL(string: "https://imfan.org")!`
-  (PC host today → VPS later: DNS moves, app never needs an update)
-- **Host allowed in-app** → same file, `let APP_HOST = "imfan.org"`
-- **App name** → `project.yml` → `CFBundleDisplayName`
-- **Icon** → `Aurorix/Resources/Assets.xcassets/AppIcon.appiconset/appicon-1024.png`
-  (source: aurorix `public/icons/icon-maskable-512.png` upscaled)
-- **Version** → `project.yml` → `MARKETING_VERSION`
+| Where | What |
+|---|---|
+| **GitHub repo (public, generic)** | `project.yml`, `Shell/Sources/*.swift`, `scripts/build_ipa.sh`, `.github/workflows/build.yml` — no name, no URL, no icon, no bundle id of any product. It reads its URL at runtime from `shell.json` inside the app bundle. |
+| **This PC only (`identity/`, git-ignored)** | `identity.json` (app name, bundle id, `https://imfan.org`), `icon-512.png` (Aurorix maskable icon) |
+| **Local step after build** | `tools/inject_identity.py` unzips the generic IPA, writes `shell.json` + Info.plist name/bundle-id + icon PNGs, rezips → `dist/Aurorix-unsigned.ipa` |
 
-## Build the IPA (free, no Mac)
+The workflow also publishes the generic IPA as a **public release asset** → it can be
+downloaded with plain `curl`, no GitHub login needed.
 
-1. Create a **public** GitHub repo (public = free unlimited Actions; macOS runners cost 10x on private).
-2. Push this folder to `main`.
-3. Actions tab → **build-ipa** → runs on push (or "Run workflow" button).
-4. When green: download the **Aurorix-unsigned-ipa** artifact → `Aurorix-unsigned.ipa` inside.
+## Pipeline
 
-Local push (from this folder, git already works):
+1. Create an empty **public** GitHub repo (any generic name) → push this folder (`identity/` is git-ignored, it never leaves this PC).
+2. Actions runs `build-ipa` on `macos-15` → `Shell-unsigned.ipa` in Releases.
+3. `curl -L -o dist/Shell-unsigned.ipa <release-url>`
+4. `python tools/inject_identity.py` → `dist/Aurorix-unsigned.ipa`
+5. Sign at `signer.esign-ios.com` (Server Certificate) → signed IPA.
+6. Host + `itms-services://` link → users install, trust once, ~1 year.
 
-```
-git remote add origin https://github.com/<you>/aurorix-ios.git
-git push -u origin main
-```
+## Changing things
 
-## Sign + publish (the no-$99 path)
+- URL / app name / bundle id → `identity/identity.json` (local only, no rebuild)
+- Icon → replace `identity/icon-512.png` (local only, no rebuild)
+- Shell behavior (webview settings) → `Shell/Sources/WebShell.swift` (needs CI rebuild)
 
-1. `signer.esign-ios.com` → upload the unsigned IPA → Server Certificate → Sign → download signed IPA.
-2. Host `app.ipa` + `manifest.plist` on HTTPS (imfan.org or buildinstaller.com).
-3. Users open in Safari:
-   `itms-services://?action=download-manifest&url=https://imfan.org/manifest.plist`
-   → Install → Settings → General → VPN & Device Management → Trust. ~1 year, no weekly re-sign.
-4. Cert revoked (all users die at once) → re-sign same IPA with the new cert → users re-install.
+## Shell features (device-first)
 
-## What the shell does (device-first)
-
-- Persistent data store: cookies + IndexedDB + OPFS downloads survive relaunch; Service Workers run in-app on iOS 16.4+ → Aurorix offline mode works.
-- Inline media (video card never forced fullscreen), back/forward swipe gesture, pull-to-refresh, dark launch screen (#0b0d12).
-- `imfan.org` navigations stay in-app; every other main-frame link (e.g. Watch on YouTube) opens Safari; YouTube embeds are iframes → always work.
-- Offline first-load → dark Retry page; saved/offline content keeps playing once cached.
+Persistent data store (cookies, IndexedDB, OPFS survive relaunch; in-app Service
+Workers on iOS 16.4+ → Aurorix offline works), inline media, swipe back,
+pull-to-refresh, target-host navigations in-app / everything else Safari,
+offline Retry page, ~1–2 MB binary.
 
 ## Honest limits
 
-- In-app Service Worker needs iOS 16.4+; on older iOS the app is online-only (Safari keeps full offline).
-- Push notifications not wired (no NSE) — not part of Aurorix today.
-- First ESign trust prompt per device is expected ("Untrusted Developer" → Trust).
+- In-app Service Worker needs iOS 16.4+ (older iOS = online-only inside the app).
+- Legacy `CFBundleIconFiles` icons (no asset catalog) — verified pattern for sideloaded IPAs; check the icon shows after your first install.
+- First ESign trust prompt per device is expected.

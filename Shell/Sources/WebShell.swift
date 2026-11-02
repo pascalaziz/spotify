@@ -1,53 +1,77 @@
 import SwiftUI
 import WebKit
 
-// ── The only two lines you ever change ────────────────────────────────
-// Site address (PC host today, VPS tomorrow — the app never needs an update,
-// DNS moves the domain, the app keeps pointing here).
-let APP_URL = URL(string: "https://imfan.org")!
-// Main-frame navigations on this host (and subdomains) stay in the app;
-// everything else the user taps opens in Safari.
-let APP_HOST = "imfan.org"
+// Generic WKWebView shell. Reads its target from shell.json inside the app
+// bundle ({"url":"https://..."}). The repo contains no product identity:
+// URL / display name / bundle id / icons are injected after the build.
 
-let AX_BG = UIColor(red: 0.043, green: 0.051, blue: 0.071, alpha: 1)   // #0b0d12
-let AX_ACCENT = UIColor(red: 0.13, green: 0.83, blue: 0.93, alpha: 1)  // cyan
-
-struct WebShell: View {
-    var body: some View {
-        WebView()
+struct ShellConfig: Codable {
+    var url: URL?
+    static func load() -> ShellConfig {
+        if let file = Bundle.main.url(forResource: "shell", withExtension: "json"),
+           let data = try? Data(contentsOf: file),
+           let cfg = try? JSONDecoder().decode(ShellConfig.self, from: data) {
+            return cfg
+        }
+        return ShellConfig(url: nil)
     }
 }
 
-struct WebView: UIViewRepresentable {
+let SHELL = ShellConfig.load()
+let SHELL_HOST = (SHELL.url?.host ?? "").lowercased()
+
+struct ShellView: View {
+    var body: some View {
+        ShellWebView()
+    }
+}
+
+struct ShellWebView: UIViewRepresentable {
     func makeCoordinator() -> Coordinator { Coordinator() }
 
     func makeUIView(context: Context) -> WKWebView {
         let config = WKWebViewConfiguration()
-        config.allowsInlineMediaPlayback = true              // video stays in its card, never forced fullscreen
-        config.mediaTypesRequiringUserActionForPlayback = [] // playback follows the site's own tap-to-play
+        config.allowsInlineMediaPlayback = true               // video stays inline, never forced fullscreen
+        config.mediaTypesRequiringUserActionForPlayback = []  // playback follows the site's own tap-to-play
         // default (persistent) data store: cookies + IndexedDB + OPFS survive relaunches,
-        // Service Workers run in-app on iOS 16.4+ → Aurorix offline mode keeps working.
+        // Service Workers run in-app on iOS 16.4+.
         let web = WKWebView(frame: .zero, configuration: config)
         web.navigationDelegate = context.coordinator
         web.uiDelegate = context.coordinator
         web.allowsBackForwardNavigationGestures = true
         web.allowsLinkPreview = true
-        web.underPageBackgroundColor = AX_BG
-        web.scrollView.backgroundColor = AX_BG
+        web.underPageBackgroundColor = .systemBackground
+        web.scrollView.backgroundColor = .systemBackground
         web.scrollView.alwaysBounceVertical = true
         context.coordinator.attach(web)
 
         let refresh = UIRefreshControl()
-        refresh.tintColor = AX_ACCENT
         refresh.addTarget(context.coordinator, action: #selector(Coordinator.pullReload), for: .valueChanged)
         web.scrollView.addSubview(refresh)
         context.coordinator.refresh = refresh
 
-        web.load(URLRequest(url: APP_URL))
+        if let url = SHELL.url {
+            web.load(URLRequest(url: url))
+        } else {
+            web.loadHTMLString(Self.unconfiguredHTML, baseURL: nil)
+        }
         return web
     }
 
     func updateUIView(_ uiView: WKWebView, context: Context) {}
+
+    private static let unconfiguredHTML = """
+    <!doctype html><html><head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+      html,body{margin:0;height:100%;display:flex;align-items:center;justify-content:center;
+        font-family:-apple-system,system-ui,sans-serif;background:#fff;color:#333}
+      p{font-size:15px;padding:24px;text-align:center}
+    </style></head><body>
+    <p>Shell is not configured yet.<br>Add shell.json to the app bundle.</p>
+    </body></html>
+    """
 }
 
 final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler {
@@ -57,7 +81,7 @@ final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptM
 
     func attach(_ web: WKWebView) {
         self.web = web
-        web.configuration.userContentController.add(self, name: "axRetry")
+        web.configuration.userContentController.add(self, name: "shellRetry")
     }
 
     @objc func pullReload() { web?.reload() }
@@ -69,17 +93,18 @@ final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptM
                  decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
         guard let url = navigationAction.url else { decisionHandler(.cancel); return }
 
-        // iframes (YouTube embeds, players) always load — never navigate away
+        // iframes (embeds, players) always load — never navigate away
         if navigationAction.targetFrame?.isMainFrame != true {
             decisionHandler(.allow)
             return
         }
+        if SHELL_HOST.isEmpty { decisionHandler(.allow); return }
         let host = (url.host ?? "").lowercased()
-        if host == APP_HOST || host.hasSuffix("." + APP_HOST) {
+        if host == SHELL_HOST || host.hasSuffix("." + SHELL_HOST) {
             decisionHandler(.allow)
             return
         }
-        // anything else on the main frame (Watch on YouTube, external links) → Safari
+        // other main-frame links → Safari
         UIApplication.shared.open(url)
         decisionHandler(.cancel)
     }
@@ -111,16 +136,16 @@ final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptM
     }
 
     private func showOffline() {
-        guard let web = web, !offlineShown else { return }
+        guard let web = web, SHELL.url != nil, !offlineShown else { return }
         offlineShown = true
         web.loadHTMLString(Self.offlineHTML, baseURL: nil)
     }
 
     func userContentController(_ userContentController: WKUserContentController,
                                didReceive message: WKScriptMessage) {
-        if message.name == "axRetry" {
+        if message.name == "shellRetry" {
             offlineShown = false
-            web?.load(URLRequest(url: APP_URL))
+            if let url = SHELL.url { web?.load(URLRequest(url: url)) }
         }
     }
 
@@ -136,13 +161,13 @@ final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptM
       h1{font-size:22px;margin:0 0 10px}
       p{font-size:15px;line-height:1.5;color:#9aa7b2;margin:0 0 26px}
       button{background:#22d3ee;color:#04222a;font-size:16px;font-weight:600;
-        border:0;border-radius:12px;padding:14px 40px;min-width:44px;min-height:44px}
+        border:0;border-radius:12px;padding:14px 40px;min-height:44px}
       button:active{opacity:.8}
     </style></head><body>
     <div class="c">
       <h1>You&rsquo;re offline</h1>
-      <p>The app needs a connection the first time it opens. Saved downloads and offline playlists keep working once they&rsquo;re cached.</p>
-      <button onclick="window.webkit.messageHandlers.axRetry.postMessage(0)">Retry</button>
+      <p>A connection is needed the first time the app opens. Saved content keeps working once it&rsquo;s cached.</p>
+      <button onclick="window.webkit.messageHandlers.shellRetry.postMessage(0)">Retry</button>
     </div>
     </body></html>
     """

@@ -1,5 +1,5 @@
 #!/bin/bash
-# Builds an UNSIGNED Aurorix.ipa — no Apple Developer account, no Mac needed.
+# Builds an UNSIGNED Shell.ipa — no Apple Developer account, no Mac needed.
 # Runs on any macOS with Xcode + xcodegen (the GitHub Actions macos runner has Xcode preinstalled).
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -14,15 +14,15 @@ rm -rf build
 mkdir -p build
 
 xcodebuild archive \
-  -project Aurorix.xcodeproj \
-  -scheme Aurorix \
+  -project Shell.xcodeproj \
+  -scheme Shell \
   -configuration Release \
   -destination 'generic/platform=iOS' \
-  -archivePath build/Aurorix.xcarchive \
+  -archivePath build/Shell.xcarchive \
   CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY=""
 
 mkdir -p build/Payload
-cp -R "build/Aurorix.xcarchive/Products/Applications/Aurorix.app" build/Payload/
+cp -R "build/Shell.xcarchive/Products/Applications/Shell.app" build/Payload/
 cd build
-zip -qry Aurorix-unsigned.ipa Payload
-echo "OK: $(pwd)/Aurorix-unsigned.ipa"
+zip -qry Shell-unsigned.ipa Payload
+echo "OK: $(pwd)/Shell-unsigned.ipa"

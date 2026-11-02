@@ -5,6 +5,9 @@ on:
     branches: [main]
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: macos-15
@@ -16,6 +19,12 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: Aurorix-unsigned-ipa
-          path: build/Aurorix-unsigned.ipa
+          name: Shell-unsigned-ipa
+          path: build/Shell-unsigned.ipa
           if-no-files-found: error
+
+      # Public release asset = downloadable WITHOUT any GitHub login (plain curl)
+      - name: Publish release
+        run: gh release create "v0.${{ github.run_number }}" build/Shell-unsigned.ipa --title "unsigned build" --notes "automated build" --latest
+        env:
+          GH_TOKEN: ${{ github.token }}

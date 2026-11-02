@@ -1,4 +1,6 @@
+# NEVER push these — local-only build outputs and product identity
 build/
-DerivedData/
+dist/
+identity/
 *.xcodeproj
 .DS_Store
