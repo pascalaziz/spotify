@@ -49,8 +49,9 @@ plist_path.write_bytes(plistlib.dumps(p))
 
 # 3) icon PNGs from identity/icon-512.png
 im = Image.open(IDENT / "icon-512.png").convert("RGBA")
+resample = Image.Resampling.LANCZOS if hasattr(Image, "Resampling") else Image.LANCZOS
 for name, size in ICONS.items():
-    im.resize((size, size), Image.LANCZOS).save(app / f"{name}.png")
+    im.resize((size, size), resample).save(app / f"{name}.png")
 
 # 4) rezip — Mach-O binary keeps the exec bit
 binary = app / app.stem

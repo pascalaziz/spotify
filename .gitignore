@@ -4,3 +4,4 @@ dist/
 identity/
 *.xcodeproj
 .DS_Store
+__pycache__/
