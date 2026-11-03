@@ -122,11 +122,17 @@ final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptM
         web.configuration.userContentController.add(self, name: "axPlay")
         NativePlayer.shared.attach(web)
         configureRemoteCommandsIfNeeded()
-        // Interruptions (calls, other apps' audio) must not permanently kill the session:
-        // reactivate it when they end. The player itself stays where the system left it.
+        // Interruptions (calls, other apps' audio): reactivate the session when they end,
+        // and resume playback when the system says it should (Spotify behavior after calls).
         NotificationCenter.default.addObserver(forName: AVAudioSession.interruptionNotification,
-                                               object: nil, queue: .main) { _ in
+                                               object: nil, queue: .main) { note in
+            let raw = note.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt
+            guard AVAudioSession.InterruptionType(rawValue: raw ?? 0) == .ended else { return }
             try? AVAudioSession.sharedInstance().setActive(true)
+            let optRaw = note.userInfo?[AVAudioSessionInterruptionOptionKey] as? UInt
+            if AVAudioSession.InterruptionOptions(rawValue: optRaw ?? 0).contains(.shouldResume) {
+                NativePlayer.shared.engageResume()
+            }
         }
     }
 
@@ -208,12 +214,19 @@ final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptM
         guard !remoteConfigured else { return }
         remoteConfigured = true
         let cc = MPRemoteCommandCenter.shared()
-        cc.playCommand.addTarget { [weak self] _ in self?.js("window.axPlayer&&window.axPlayer.play()"); return .success }
-        cc.pauseCommand.addTarget { [weak self] _ in self?.js("window.axPlayer&&window.axPlayer.pause()"); return .success }
+        cc.playCommand.addTarget { [weak self] _ in
+            NativePlayer.shared.engageResume()
+            self?.js("window.axPlayer&&window.axPlayer.play()"); return .success
+        }
+        cc.pauseCommand.addTarget { [weak self] _ in
+            NativePlayer.shared.engagePause()
+            self?.js("window.axPlayer&&window.axPlayer.pause()"); return .success
+        }
         cc.nextTrackCommand.addTarget { [weak self] _ in self?.js("window.axPlayer&&window.axPlayer.next()"); return .success }
         cc.previousTrackCommand.addTarget { [weak self] _ in self?.js("window.axPlayer&&window.axPlayer.prev()"); return .success }
         cc.changePlaybackPositionCommand.addTarget { [weak self] e in
             let t = (e as? MPChangePlaybackPositionCommandEvent)?.positionTime ?? 0
+            NativePlayer.shared.engageSeek(t)
             self?.js("window.axPlayer&&window.axPlayer.seekTo(\(t))"); return .success
         }
     }
@@ -261,6 +274,7 @@ final class NativePlayer: NSObject {
     private var endObs: NSObjectProtocol?
     private var buf = Data()
     private var autoPlay = true
+    private var engaged = false
     private var title = ""
     private var artist = ""
     private var dur = 0.0
@@ -297,7 +311,13 @@ final class NativePlayer: NSObject {
         case "seek":
             if let t = d["t"] as? Double {
                 av?.seek(to: CMTime(seconds: t, preferredTimescale: 600))
+                card()
             }
+        case "release":
+            // the page moved to a web-path track (video/embed/link): stand down fully
+            av?.pause()
+            engaged = false
+            MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
         default:
             break
         }
@@ -311,6 +331,7 @@ final class NativePlayer: NSObject {
         rateObs?.invalidate()
         let player = AVPlayer(playerItem: AVPlayerItem(url: url))
         av = player
+        engaged = true
         rateObs = player.observe(\.rate, options: [.new]) { [weak self] p, _ in
             self?.state(playing: p.rate > 0)
         }
@@ -331,6 +352,7 @@ final class NativePlayer: NSObject {
 
     private func state(playing: Bool) {
         emit("{type:'state',playing:\(playing)}")
+        card()   // the ticks stop while paused - the card's rate/glyph must be restated here
     }
 
     private func ended() {
@@ -352,4 +374,11 @@ final class NativePlayer: NSObject {
         info[MPNowPlayingInfoPropertyPlaybackRate] = ((av?.rate ?? 0) > 0) ? 1.0 : 0.0
         MPNowPlayingInfoCenter.default().nowPlayingInfo = info
     }
+
+    // Direct widget paths: the engine answers play/pause/seek INSTANTLY, even if the
+    // page's JS is momentarily unscheduled. The page still gets the command for state/UI.
+    // Guarded by `engaged` so a web-path track (video/embed) is never hijacked.
+    func engagePause() { guard engaged else { return }; av?.pause() }
+    func engageResume() { guard engaged else { return }; av?.play() }
+    func engageSeek(_ t: Double) { guard engaged else { return }; av?.seek(to: CMTime(seconds: t, preferredTimescale: 600)); card() }
 }
