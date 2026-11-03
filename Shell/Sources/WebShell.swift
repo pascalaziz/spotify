@@ -275,6 +275,9 @@ final class NativePlayer: NSObject {
     private var buf = Data()
     private var autoPlay = true
     private var engaged = false
+    private var artURL = ""
+    private var artFetchURL = ""
+    private let artCache = NSCache<NSString, UIImage>()
     private var title = ""
     private var artist = ""
     private var dur = 0.0
@@ -299,6 +302,7 @@ final class NativePlayer: NSObject {
             title = (d["title"] as? String) ?? "Track"
             artist = (d["artist"] as? String) ?? ""
             dur = (d["dur"] as? Double) ?? 0
+            artURL = (d["art"] as? String) ?? ""
             if let s = d["data"] as? String, let dd = Data(base64Encoded: s) { buf.append(dd) }
         case "chunk":
             if let s = d["data"] as? String, let dd = Data(base64Encoded: s) { buf.append(dd) }
@@ -346,6 +350,7 @@ final class NativePlayer: NSObject {
     private func tick(_ t: Double) {
         let d = av?.currentItem?.duration.seconds ?? 0
         let dur2 = (d.isFinite && d > 0) ? d : dur
+        if dur2 > 0 && dur != dur2 { dur = dur2 }   // learn the REAL duration -> the card's line + times
         emit("{type:'time',t:\(t),dur:\(dur2)}")
         card()
     }
@@ -372,7 +377,35 @@ final class NativePlayer: NSObject {
         if dur > 0 { info[MPMediaItemPropertyPlaybackDuration] = dur }
         if let t = av?.currentTime().seconds, t.isFinite { info[MPNowPlayingInfoPropertyElapsedPlaybackTime] = max(0, t) }
         info[MPNowPlayingInfoPropertyPlaybackRate] = ((av?.rate ?? 0) > 0) ? 1.0 : 0.0
+        if let img = currentArt() {
+            info[MPMediaItemPropertyArtwork] = MPMediaItemArtwork(boundsSize: img.size) { _ in img }
+        }
         MPNowPlayingInfoCenter.default().nowPlayingInfo = info
+        maybeFetchArt()
+    }
+
+    // Artwork: the track's thumbnail (page-sent URL, cached) with the bundled brand
+    // art as the standing fallback. Fetch is async; the card is restated on arrival.
+    private lazy var defaultArt: UIImage? = UIImage(named: "nowplaying")
+
+    private func currentArt() -> UIImage? {
+        if !artURL.isEmpty, let img = artCache.object(forKey: artURL as NSString) { return img }
+        return defaultArt
+    }
+
+    private func maybeFetchArt() {
+        let u = artURL
+        guard !u.isEmpty, artCache.object(forKey: u as NSString) == nil, artFetchURL != u,
+              let url = URL(string: u) else { return }
+        artFetchURL = u
+        URLSession.shared.dataTask(with: url) { [weak self] data, _, _ in
+            guard let data = data, let img = UIImage(data: data) else {
+                DispatchQueue.main.async { self?.artFetchURL = "" }
+                return
+            }
+            self?.artCache.setObject(img, forKey: u as NSString)
+            DispatchQueue.main.async { self?.artFetchURL = ""; self?.card() }
+        }.resume()
     }
 
     // Direct widget paths: the engine answers play/pause/seek INSTANTLY, even if the
