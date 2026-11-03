@@ -122,17 +122,22 @@ final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptM
         web.configuration.userContentController.add(self, name: "axPlay")
         NativePlayer.shared.attach(web)
         configureRemoteCommandsIfNeeded()
-        // Interruptions (calls, other apps' audio): reactivate the session when they end,
-        // and resume playback when the system says it should (Spotify behavior after calls).
+        // Interruptions (calls, other apps' audio): on .began pause deterministically and
+        // keep the card; on .ended re-claim the session + card but never auto-resume -
+        // only a user press plays again (his rule, 2026-11-04).
         NotificationCenter.default.addObserver(forName: AVAudioSession.interruptionNotification,
                                                object: nil, queue: .main) { note in
             let raw = note.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt
-            guard AVAudioSession.InterruptionType(rawValue: raw ?? 0) == .ended else { return }
-            try? AVAudioSession.sharedInstance().setActive(true)
-            let optRaw = note.userInfo?[AVAudioSessionInterruptionOptionKey] as? UInt
-            if AVAudioSession.InterruptionOptions(rawValue: optRaw ?? 0).contains(.shouldResume) {
-                NativePlayer.shared.engageResume()
+            if AVAudioSession.InterruptionType(rawValue: raw ?? 0) == .began {
+                NativePlayer.shared.interrupt()
+                return
             }
+            NativePlayer.shared.reclaimAfterInterruption()
+        }
+        // Rare system-level media services reset: same recovery, still no auto-resume.
+        NotificationCenter.default.addObserver(forName: AVAudioSession.mediaServicesWereResetNotification,
+                                               object: nil, queue: .main) { _ in
+            NativePlayer.shared.reclaimAfterInterruption()
         }
     }
 
@@ -310,6 +315,7 @@ final class NativePlayer: NSObject {
         case "finish":
             load()
         case "resume":
+            claim()
             rewindIfEnded()
             av?.play()
         case "pause":
@@ -345,7 +351,7 @@ final class NativePlayer: NSObject {
                                                  queue: .main) { [weak self] t in
             self?.tick(t.seconds)
         }
-        if autoPlay { player.play() }
+        if autoPlay { claim(); player.play() }
         card()
     }
 
@@ -417,8 +423,30 @@ final class NativePlayer: NSObject {
     // page's JS is momentarily unscheduled. The page still gets the command for state/UI.
     // Guarded by `engaged` so a web-path track (video/embed) is never hijacked.
     func engagePause() { guard engaged else { return }; av?.pause() }
-    func engageResume() { guard engaged else { return }; rewindIfEnded(); av?.play() }
+    func engageResume() { guard engaged else { return }; claim(); rewindIfEnded(); av?.play() }
     func engageSeek(_ t: Double) { guard engaged else { return }; av?.seek(to: CMTime(seconds: t, preferredTimescale: 600)); card() }
+
+    // (Re)claim the audio session. Another app's audio (Facebook Reels, a call) deactivates
+    // ours mid-play; every play attempt must re-activate first or the play silently fails
+    // and iOS hands the Now Playing card to the interrupting app - the "instant die" bug.
+    private func claim() {
+        let s = AVAudioSession.sharedInstance()
+        try? s.setCategory(.playback, mode: .default)
+        try? s.setActive(true)
+    }
+
+    // Interruption began (another app took the audio): pause deterministically, card alive.
+    func interrupt() {
+        av?.pause()
+        card()
+    }
+
+    // Interruption ended / media services reset: take the session + card back, but NEVER
+    // auto-resume - only a user press plays again (his rule).
+    func reclaimAfterInterruption() {
+        claim()
+        card()
+    }
 
     // A finished item has rate 0 at its end: pressing Play must RESTART it, not no-op
     // (Spotify replays the last track). _onQueueEnd already rewound the page-side clock;
