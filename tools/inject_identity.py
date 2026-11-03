@@ -44,7 +44,8 @@ ICONS = {
     "AppIcon76x76@2x": 152,
 }
 entries = sorted({n.split("@")[0] for n in ICONS})
-p["CFBundleIcons"] = {"CFBundleIconFiles": entries}
+p["CFBundleIcons"] = {"CFBundlePrimaryIcon": {"CFBundleIconFiles": entries + sorted(ICONS)}}
+p["CFBundleIconFiles"] = entries + sorted(ICONS)
 plist_path.write_bytes(plistlib.dumps(p))
 
 # 3) icon PNGs from identity/icon-512.png
@@ -56,7 +57,7 @@ for name, size in ICONS.items():
 # 4) rezip — Mach-O binary keeps the exec bit
 binary = app / app.stem
 assert binary.exists(), f"binary not found: {binary}"
-out = DIST / f"{APP_NAME}-unsigned.ipa"
+out = DIST / "app-unsigned.ipa"
 with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
     for f in sorted(work.rglob("*")):
         if f.is_file():

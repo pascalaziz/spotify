@@ -1,5 +1,6 @@
 import SwiftUI
 import WebKit
+import AVFoundation
 
 // Generic WKWebView shell. Reads its target from shell.json inside the app
 // bundle ({"url":"https://..."}). The repo contains no product identity:
@@ -30,9 +31,21 @@ struct ShellWebView: UIViewRepresentable {
     func makeCoordinator() -> Coordinator { Coordinator() }
 
     func makeUIView(context: Context) -> WKWebView {
+        // Music-app audio session (Spotify-style): .playback keeps audio off the ambient/
+        // silent-switch path and, with UIBackgroundModes=audio, keeps the app + its
+        // Now Playing card alive in the background while media runs.
+        try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .default)
+        try? AVAudioSession.sharedInstance().setActive(true)
+
         let config = WKWebViewConfiguration()
         config.allowsInlineMediaPlayback = true               // video stays inline, never forced fullscreen
         config.mediaTypesRequiringUserActionForPlayback = []  // playback follows the site's own tap-to-play
+        // Tell the page it runs inside the native shell (native background audio exists,
+        // so the web-side keep-alive workaround is disabled there).
+        config.userContentController.addUserScript(
+            WKUserScript(source: "window.__AX_NATIVE=1;",
+                         injectionTime: .atDocumentStart,
+                         forMainFrameOnly: true))
         // default (persistent) data store: cookies + IndexedDB + OPFS survive relaunches,
         // Service Workers run in-app on iOS 16.4+.
         let web = WKWebView(frame: .zero, configuration: config)

@@ -5,3 +5,5 @@ identity/
 *.xcodeproj
 .DS_Store
 __pycache__/
+cert/
+deploy/
