@@ -1,6 +1,7 @@
 import SwiftUI
 import WebKit
 import AVFoundation
+import MediaPlayer
 
 // Generic WKWebView shell. Reads its target from shell.json inside the app
 // bundle ({"url":"https://..."}). The repo contains no product identity:
@@ -46,6 +47,13 @@ struct ShellWebView: UIViewRepresentable {
             WKUserScript(source: "window.__AX_NATIVE=1;",
                          injectionTime: .atDocumentStart,
                          forMainFrameOnly: true))
+        // Media bridge: the page's player state (window.axPlayer) is posted here every second
+        // while anything changes; the app OWNS the Now Playing card (Spotify-style) so it
+        // survives pause + backgrounding even when the web process is suspended.
+        config.userContentController.addUserScript(
+            WKUserScript(source: Self.mediaBridgeJS,
+                         injectionTime: .atDocumentStart,
+                         forMainFrameOnly: true))
         // default (persistent) data store: cookies + IndexedDB + OPFS survive relaunches,
         // Service Workers run in-app on iOS 16.4+.
         let web = WKWebView(frame: .zero, configuration: config)
@@ -73,6 +81,31 @@ struct ShellWebView: UIViewRepresentable {
 
     func updateUIView(_ uiView: WKWebView, context: Context) {}
 
+    // Runs in the page from document-start. Reads the site's own player (window.axPlayer:
+    // play/pause/next/prev/seekTo/playing/queue/_currentTime/_duration) and posts CHANGES
+    // only — track change, play/pause, and ~5 s of position drift while playing. Paused =
+    // no posts = the native card freezes on the last state (exactly right).
+    static let mediaBridgeJS = """
+    (function () {
+      if (!window.__AX_NATIVE) return;
+      var last = '';
+      function post(o) { try { window.webkit.messageHandlers.axMedia.postMessage(o); } catch (e) {} }
+      setInterval(function () {
+        try {
+          var p = window.axPlayer; if (!p || !p.queue || p.index == null) return;
+          var it = p.queue[p.index]; if (!it) return;
+          var playing = !!p.playing;
+          var title = it.title || 'Untitled';
+          var artist = (typeof p.axArtist === 'function' && p.axArtist(it)) || '';
+          var pos = Number((typeof p._currentTime === 'function' ? p._currentTime() : 0) || 0);
+          var dur = Number((typeof p._duration === 'function' ? p._duration() : 0) || 0);
+          var key = title + '|' + artist + '|' + playing + '|' + (dur ? Math.round(pos / 5) : 0);
+          if (key !== last) { last = key; post({ title: title, artist: artist, playing: playing, pos: pos, dur: dur }); }
+        } catch (e) {}
+      }, 1000);
+    })();
+    """
+
     private static let unconfiguredHTML = """
     <!doctype html><html><head>
     <meta charset="utf-8">
@@ -91,10 +124,13 @@ final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptM
     weak var web: WKWebView?
     var refresh: UIRefreshControl?
     private var offlineShown = false
+    private var remoteConfigured = false
+    private var card: [String: Any] = [:]
 
     func attach(_ web: WKWebView) {
         self.web = web
         web.configuration.userContentController.add(self, name: "shellRetry")
+        web.configuration.userContentController.add(self, name: "axMedia")
     }
 
     @objc func pullReload() { web?.reload() }
@@ -160,6 +196,45 @@ final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptM
             offlineShown = false
             if let url = SHELL.url { web?.load(URLRequest(url: url)) }
         }
+        if message.name == "axMedia", let d = message.body as? [String: Any] {
+            card["title"] = d["title"]
+            card["artist"] = d["artist"]
+            card["dur"] = d["dur"]
+            card["pos"] = d["pos"]
+            card["playing"] = d["playing"]
+            updateNowPlayingCard()
+            configureRemoteCommandsIfNeeded()
+        }
+    }
+
+    // MARK: - Native Now Playing (the app owns the card, Spotify-style)
+
+    private func updateNowPlayingCard() {
+        var info: [String: Any] = [:]
+        info[MPMediaItemPropertyTitle] = (card["title"] as? String) ?? ""
+        info[MPMediaItemPropertyArtist] = (card["artist"] as? String) ?? ""
+        if let dur = card["dur"] as? Double, dur > 0 { info[MPMediaItemPropertyPlaybackDuration] = dur }
+        if let pos = card["pos"] as? Double { info[MPNowPlayingInfoPropertyElapsedPlaybackTime] = pos }
+        info[MPNowPlayingInfoPropertyPlaybackRate] = ((card["playing"] as? Bool) ?? false) ? 1.0 : 0.0
+        MPNowPlayingInfoCenter.default().nowPlayingInfo = info
+    }
+
+    private func configureRemoteCommandsIfNeeded() {
+        guard !remoteConfigured else { return }
+        remoteConfigured = true
+        let cc = MPRemoteCommandCenter.shared()
+        cc.playCommand.addTarget { [weak self] _ in self?.js("window.axPlayer&&window.axPlayer.play()"); return .success }
+        cc.pauseCommand.addTarget { [weak self] _ in self?.js("window.axPlayer&&window.axPlayer.pause()"); return .success }
+        cc.nextTrackCommand.addTarget { [weak self] _ in self?.js("window.axPlayer&&window.axPlayer.next()"); return .success }
+        cc.previousTrackCommand.addTarget { [weak self] _ in self?.js("window.axPlayer&&window.axPlayer.prev()"); return .success }
+        cc.changePlaybackPositionCommand.addTarget { [weak self] e in
+            let t = (e as? MPChangePlaybackPositionCommandEvent)?.positionTime ?? 0
+            self?.js("window.axPlayer&&window.axPlayer.seekTo(\(t))"); return .success
+        }
+    }
+
+    private func js(_ script: String) {
+        web?.evaluateJavaScript(script, completionHandler: nil)
     }
 
     private static let offlineHTML = """
