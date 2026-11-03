@@ -89,7 +89,7 @@ struct ShellWebView: UIViewRepresentable {
     (function () {
       if (!window.__AX_NATIVE) return;
       var last = '';
-      function post(o) { try { window.webkit.messageHandlers.axMedia.postMessage(o); } catch (e) {} }
+      function post(o) { try { window.__axBridgePosts = (window.__axBridgePosts || 0) + 1; window.webkit.messageHandlers.axMedia.postMessage(o); } catch (e) {} }
       setInterval(function () {
         try {
           var p = window.axPlayer; if (!p || !p.queue || p.index == null) return;
@@ -126,11 +126,19 @@ final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptM
     private var offlineShown = false
     private var remoteConfigured = false
     private var card: [String: Any] = [:]
+    private var silent: AVAudioPlayer?
 
     func attach(_ web: WKWebView) {
         self.web = web
         web.configuration.userContentController.add(self, name: "shellRetry")
         web.configuration.userContentController.add(self, name: "axMedia")
+        // Interruptions (calls, other apps' audio) must not permanently kill the session:
+        // reactivate and restart the silent keeper when they end.
+        NotificationCenter.default.addObserver(forName: AVAudioSession.interruptionNotification,
+                                               object: nil, queue: .main) { [weak self] _ in
+            try? AVAudioSession.sharedInstance().setActive(true)
+            self?.silent?.play()
+        }
     }
 
     @objc func pullReload() { web?.reload() }
@@ -204,10 +212,33 @@ final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptM
             card["playing"] = d["playing"]
             updateNowPlayingCard()
             configureRemoteCommandsIfNeeded()
+            startSilentKeeper()
         }
     }
 
     // MARK: - Native Now Playing (the app owns the card, Spotify-style)
+
+    // Real audio activity in the APP process (1 s of looping silence, volume 0). An
+    // active-but-idle session is not enough on modern iOS: with genuine I/O the app
+    // can never be suspended while backgrounded — paused included — which is what
+    // keeps both the card and the remote commands alive indefinitely.
+    private func startSilentKeeper() {
+        guard silent == nil else { return }
+        let samples = 4410                                   // 1 s, 16-bit mono, 4.41 kHz
+        var wav = Data()
+        func le32(_ v: Int) { var x = UInt32(v).littleEndian; withUnsafeBytes(of: &x) { wav.append(contentsOf: $0) } }
+        func le16(_ v: Int) { var x = UInt16(v).littleEndian; withUnsafeBytes(of: &x) { wav.append(contentsOf: $0) } }
+        wav.append(contentsOf: Array("RIFF".utf8)); le32(36 + samples * 2); wav.append(contentsOf: Array("WAVE".utf8))
+        wav.append(contentsOf: Array("fmt ".utf8)); le32(16); le16(1); le16(1); le32(4410); le32(4410 * 2); le16(2); le16(16)
+        wav.append(contentsOf: Array("data".utf8)); le32(samples * 2); wav.append(Data(count: samples * 2))
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("ax-silence.wav")
+        do { try wav.write(to: url) } catch { return }
+        silent = try? AVAudioPlayer(contentsOf: url)
+        silent?.numberOfLoops = -1
+        silent?.volume = 0
+        silent?.prepareToPlay()
+        silent?.play()
+    }
 
     private func updateNowPlayingCard() {
         var info: [String: Any] = [:]
