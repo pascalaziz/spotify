@@ -277,6 +277,7 @@ final class NativePlayer: NSObject {
     private var engaged = false
     private var artURL = ""
     private var artFetchURL = ""
+    private var artFailed = Set<String>()
     private let artCache = NSCache<NSString, UIImage>()
     private var title = ""
     private var artist = ""
@@ -395,12 +396,15 @@ final class NativePlayer: NSObject {
 
     private func maybeFetchArt() {
         let u = artURL
-        guard !u.isEmpty, artCache.object(forKey: u as NSString) == nil, artFetchURL != u,
+        guard !u.isEmpty, !artFailed.contains(u),
+              artCache.object(forKey: u as NSString) == nil, artFetchURL != u,
               let url = URL(string: u) else { return }
         artFetchURL = u
         URLSession.shared.dataTask(with: url) { [weak self] data, _, _ in
             guard let data = data, let img = UIImage(data: data) else {
-                DispatchQueue.main.async { self?.artFetchURL = "" }
+                // ONE attempt per URL: offline/dead thumbnails must not re-fetch on
+                // every card() tick (0.5s while playing). The bundled art stands in.
+                DispatchQueue.main.async { self?.artFailed.insert(u); self?.artFetchURL = "" }
                 return
             }
             self?.artCache.setObject(img, forKey: u as NSString)
