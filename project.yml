@@ -32,6 +32,8 @@ targets:
         UILaunchScreen: {}
         UIRequiresFullScreen: false
         ITSAppUsesNonExemptEncryption: false
+        UIBackgroundModes:
+          - audio
         UISupportedInterfaceOrientations~iphone:
           - UIInterfaceOrientationPortrait
           - UIInterfaceOrientationLandscapeLeft
