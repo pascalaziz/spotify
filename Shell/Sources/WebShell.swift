@@ -296,7 +296,7 @@ final class NativePlayer: NSObject {
             av?.pause()
         case "seek":
             if let t = d["t"] as? Double {
-                av?.seek(to: CMTime(seconds: t, preferredTimescale: 600), completionHandler: nil)
+                av?.seek(to: CMTime(seconds: t, preferredTimescale: 600))
             }
         default:
             break
