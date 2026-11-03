@@ -310,6 +310,7 @@ final class NativePlayer: NSObject {
         case "finish":
             load()
         case "resume":
+            rewindIfEnded()
             av?.play()
         case "pause":
             av?.pause()
@@ -416,6 +417,16 @@ final class NativePlayer: NSObject {
     // page's JS is momentarily unscheduled. The page still gets the command for state/UI.
     // Guarded by `engaged` so a web-path track (video/embed) is never hijacked.
     func engagePause() { guard engaged else { return }; av?.pause() }
-    func engageResume() { guard engaged else { return }; av?.play() }
+    func engageResume() { guard engaged else { return }; rewindIfEnded(); av?.play() }
     func engageSeek(_ t: Double) { guard engaged else { return }; av?.seek(to: CMTime(seconds: t, preferredTimescale: 600)); card() }
+
+    // A finished item has rate 0 at its end: pressing Play must RESTART it, not no-op
+    // (Spotify replays the last track). _onQueueEnd already rewound the page-side clock;
+    // this covers every other ended state.
+    private func rewindIfEnded() {
+        guard let item = av?.currentItem else { return }
+        let d = item.duration.seconds
+        let t = av?.currentTime().seconds ?? 0
+        if d.isFinite, d > 0, t >= d - 0.15 { av?.seek(to: .zero) }
+    }
 }
