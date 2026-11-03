@@ -47,9 +47,10 @@ struct ShellWebView: UIViewRepresentable {
             WKUserScript(source: "window.__AX_NATIVE=1;",
                          injectionTime: .atDocumentStart,
                          forMainFrameOnly: true))
-        // Media bridge: the page's player state (window.axPlayer) is posted here every second
-        // while anything changes; the app OWNS the Now Playing card (Spotify-style) so it
-        // survives pause + backgrounding even when the web process is suspended.
+        // Media bridge: control/event helpers. The page's player stays the brain (queue, UI,
+        // state machine) and drives the app's OWN audio engine through __axNativeCtl; the
+        // engine reports time/state/end back through __axNativeEvent. The app owns the audio
+        // session, the Now Playing card and the lock-screen buttons - the Spotify architecture.
         config.userContentController.addUserScript(
             WKUserScript(source: Self.mediaBridgeJS,
                          injectionTime: .atDocumentStart,
@@ -81,28 +82,17 @@ struct ShellWebView: UIViewRepresentable {
 
     func updateUIView(_ uiView: WKWebView, context: Context) {}
 
-    // Runs in the page from document-start. Reads the site's own player (window.axPlayer:
-    // play/pause/next/prev/seekTo/playing/queue/_currentTime/_duration) and posts CHANGES
-    // only — track change, play/pause, and ~5 s of position drift while playing. Paused =
-    // no posts = the native card freezes on the last state (exactly right).
+    // Runs in the page from document-start. Small control/event surface for the native
+    // audio engine: the page sends commands, the engine sends state.
     static let mediaBridgeJS = """
     (function () {
       if (!window.__AX_NATIVE) return;
-      var last = '';
-      function post(o) { try { window.__axBridgePosts = (window.__axBridgePosts || 0) + 1; window.webkit.messageHandlers.axMedia.postMessage(o); } catch (e) {} }
-      setInterval(function () {
-        try {
-          var p = window.axPlayer; if (!p || !p.queue || p.index == null) return;
-          var it = p.queue[p.index]; if (!it) return;
-          var playing = !!p.playing;
-          var title = it.title || 'Untitled';
-          var artist = (typeof p.axArtist === 'function' && p.axArtist(it)) || '';
-          var pos = Number((typeof p._currentTime === 'function' ? p._currentTime() : 0) || 0);
-          var dur = Number((typeof p._duration === 'function' ? p._duration() : 0) || 0);
-          var key = title + '|' + artist + '|' + playing + '|' + (dur ? Math.round(pos / 5) : 0);
-          if (key !== last) { last = key; post({ title: title, artist: artist, playing: playing, pos: pos, dur: dur }); }
-        } catch (e) {}
-      }, 1000);
+      window.__axNativeCtl = function (op, t) {
+        try { window.webkit.messageHandlers.axPlay.postMessage({ op: op, t: t || 0 }); } catch (e) {}
+      };
+      window.__axNativeEvent = function (e) {
+        try { window.dispatchEvent(new CustomEvent('axnative', { detail: e })); } catch (err) {}
+      };
     })();
     """
 
@@ -125,19 +115,18 @@ final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptM
     var refresh: UIRefreshControl?
     private var offlineShown = false
     private var remoteConfigured = false
-    private var card: [String: Any] = [:]
-    private var silent: AVAudioPlayer?
 
     func attach(_ web: WKWebView) {
         self.web = web
         web.configuration.userContentController.add(self, name: "shellRetry")
-        web.configuration.userContentController.add(self, name: "axMedia")
+        web.configuration.userContentController.add(self, name: "axPlay")
+        NativePlayer.shared.attach(web)
+        configureRemoteCommandsIfNeeded()
         // Interruptions (calls, other apps' audio) must not permanently kill the session:
-        // reactivate and restart the silent keeper when they end.
+        // reactivate it when they end. The player itself stays where the system left it.
         NotificationCenter.default.addObserver(forName: AVAudioSession.interruptionNotification,
-                                               object: nil, queue: .main) { [weak self] _ in
+                                               object: nil, queue: .main) { _ in
             try? AVAudioSession.sharedInstance().setActive(true)
-            self?.silent?.play()
         }
     }
 
@@ -204,51 +193,16 @@ final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptM
             offlineShown = false
             if let url = SHELL.url { web?.load(URLRequest(url: url)) }
         }
-        if message.name == "axMedia", let d = message.body as? [String: Any] {
-            card["title"] = d["title"]
-            card["artist"] = d["artist"]
-            card["dur"] = d["dur"]
-            card["pos"] = d["pos"]
-            card["playing"] = d["playing"]
-            updateNowPlayingCard()
-            configureRemoteCommandsIfNeeded()
-            startSilentKeeper()
+        if message.name == "axPlay", let d = message.body as? [String: Any] {
+            NativePlayer.shared.message(d)
         }
     }
 
-    // MARK: - Native Now Playing (the app owns the card, Spotify-style)
-
-    // Real audio activity in the APP process (1 s of looping silence, volume 0). An
-    // active-but-idle session is not enough on modern iOS: with genuine I/O the app
-    // can never be suspended while backgrounded — paused included — which is what
-    // keeps both the card and the remote commands alive indefinitely.
-    private func startSilentKeeper() {
-        guard silent == nil else { return }
-        let samples = 4410                                   // 1 s, 16-bit mono, 4.41 kHz
-        var wav = Data()
-        func le32(_ v: Int) { var x = UInt32(v).littleEndian; withUnsafeBytes(of: &x) { wav.append(contentsOf: $0) } }
-        func le16(_ v: Int) { var x = UInt16(v).littleEndian; withUnsafeBytes(of: &x) { wav.append(contentsOf: $0) } }
-        wav.append(contentsOf: Array("RIFF".utf8)); le32(36 + samples * 2); wav.append(contentsOf: Array("WAVE".utf8))
-        wav.append(contentsOf: Array("fmt ".utf8)); le32(16); le16(1); le16(1); le32(4410); le32(4410 * 2); le16(2); le16(16)
-        wav.append(contentsOf: Array("data".utf8)); le32(samples * 2); wav.append(Data(count: samples * 2))
-        let url = FileManager.default.temporaryDirectory.appendingPathComponent("ax-silence.wav")
-        do { try wav.write(to: url) } catch { return }
-        silent = try? AVAudioPlayer(contentsOf: url)
-        silent?.numberOfLoops = -1
-        silent?.volume = 0
-        silent?.prepareToPlay()
-        silent?.play()
-    }
-
-    private func updateNowPlayingCard() {
-        var info: [String: Any] = [:]
-        info[MPMediaItemPropertyTitle] = (card["title"] as? String) ?? ""
-        info[MPMediaItemPropertyArtist] = (card["artist"] as? String) ?? ""
-        if let dur = card["dur"] as? Double, dur > 0 { info[MPMediaItemPropertyPlaybackDuration] = dur }
-        if let pos = card["pos"] as? Double { info[MPNowPlayingInfoPropertyElapsedPlaybackTime] = pos }
-        info[MPNowPlayingInfoPropertyPlaybackRate] = ((card["playing"] as? Bool) ?? false) ? 1.0 : 0.0
-        MPNowPlayingInfoCenter.default().nowPlayingInfo = info
-    }
+    // MARK: - Lock screen / widget buttons
+    // Every command routes through the page's own player methods, so the queue, the UI and
+    // the diagnostics all update on the same single path a screen tap uses. In native audio
+    // mode those methods forward to the app's engine; in web mode (video/embeds) they drive
+    // the element exactly as before. One command center, both modes.
 
     private func configureRemoteCommandsIfNeeded() {
         guard !remoteConfigured else { return }
@@ -290,4 +244,112 @@ final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptM
     </div>
     </body></html>
     """
+}
+
+// MARK: - Native audio engine (the Spotify part)
+// The app itself plays the track: AVPlayer holds the audio session with real I/O, so a
+// paused player keeps the session valid and the app unsuspended - no keep-alive tricks.
+// The page hands the file over in base64 chunks (its storage is sandboxed to the webview),
+// then commands it like a remote: resume / pause / seek / (next & prev stay page-side,
+// because the queue lives there). State flows back as 'axnative' events.
+
+final class NativePlayer: NSObject {
+    static let shared = NativePlayer()
+    private var av: AVPlayer?
+    private var timeObs: Any?
+    private var rateObs: NSKeyValueObservation?
+    private var endObs: NSObjectProtocol?
+    private var buf = Data()
+    private var autoPlay = true
+    private var title = ""
+    private var artist = ""
+    private var dur = 0.0
+    weak var web: WKWebView?
+
+    func attach(_ web: WKWebView) {
+        self.web = web
+        if endObs == nil {
+            endObs = NotificationCenter.default.addObserver(forName: .AVPlayerItemDidPlayToEndTime,
+                                                            object: nil, queue: .main) { [weak self] _ in
+                self?.ended()
+            }
+        }
+    }
+
+    func message(_ d: [String: Any]) {
+        let op = d["op"] as? String ?? ""
+        switch op {
+        case "start":
+            buf = Data()
+            autoPlay = (d["play"] as? Bool) ?? true
+            title = (d["title"] as? String) ?? "Track"
+            artist = (d["artist"] as? String) ?? ""
+            dur = (d["dur"] as? Double) ?? 0
+            if let s = d["data"] as? String, let dd = Data(base64Encoded: s) { buf.append(dd) }
+        case "chunk":
+            if let s = d["data"] as? String, let dd = Data(base64Encoded: s) { buf.append(dd) }
+        case "finish":
+            load()
+        case "resume":
+            av?.play()
+        case "pause":
+            av?.pause()
+        case "seek":
+            if let t = d["t"] as? Double {
+                av?.seek(to: CMTime(seconds: t, preferredTimescale: 600), completionHandler: nil)
+            }
+        default:
+            break
+        }
+    }
+
+    private func load() {
+        guard !buf.isEmpty else { emit("{type:'error'}"); return }
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("ax-track.mp3")
+        do { try buf.write(to: url, options: .atomic) } catch { emit("{type:'error'}"); return }
+        if let o = timeObs, let p = av { p.removeTimeObserver(o) }
+        rateObs?.invalidate()
+        let player = AVPlayer(playerItem: AVPlayerItem(url: url))
+        av = player
+        rateObs = player.observe(\.rate, options: [.new]) { [weak self] p, _ in
+            self?.state(playing: p.rate > 0)
+        }
+        timeObs = player.addPeriodicTimeObserver(forInterval: CMTime(seconds: 0.5, preferredTimescale: 600),
+                                                 queue: .main) { [weak self] t in
+            self?.tick(t.seconds)
+        }
+        if autoPlay { player.play() }
+        card()
+    }
+
+    private func tick(_ t: Double) {
+        let d = av?.currentItem?.duration.seconds ?? 0
+        let dur2 = (d.isFinite && d > 0) ? d : dur
+        emit("{type:'time',t:\(t),dur:\(dur2)}")
+        card()
+    }
+
+    private func state(playing: Bool) {
+        emit("{type:'state',playing:\(playing)}")
+    }
+
+    private func ended() {
+        state(playing: false)
+        emit("{type:'ended'}")
+    }
+
+    private func emit(_ json: String) {
+        web?.evaluateJavaScript("window.__axNativeEvent&&window.__axNativeEvent(\(json))",
+                                completionHandler: nil)
+    }
+
+    private func card() {
+        var info: [String: Any] = [:]
+        info[MPMediaItemPropertyTitle] = title
+        info[MPMediaItemPropertyArtist] = artist
+        if dur > 0 { info[MPMediaItemPropertyPlaybackDuration] = dur }
+        if let t = av?.currentTime().seconds, t.isFinite { info[MPNowPlayingInfoPropertyElapsedPlaybackTime] = max(0, t) }
+        info[MPNowPlayingInfoPropertyPlaybackRate] = ((av?.rate ?? 0) > 0) ? 1.0 : 0.0
+        MPNowPlayingInfoCenter.default().nowPlayingInfo = info
+    }
 }
