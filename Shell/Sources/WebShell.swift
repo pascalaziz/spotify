@@ -227,8 +227,14 @@ final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptM
             NativePlayer.shared.engagePause()
             self?.js("window.axPlayer&&window.axPlayer.pause()"); return .success
         }
-        cc.nextTrackCommand.addTarget { [weak self] _ in self?.js("window.axPlayer&&window.axPlayer.next()"); return .success }
-        cc.previousTrackCommand.addTarget { [weak self] _ in self?.js("window.axPlayer&&window.axPlayer.prev()"); return .success }
+        cc.nextTrackCommand.addTarget { [weak self] _ in
+            if !NativePlayer.shared.nativeAdvance(1) { self?.js("window.axPlayer&&window.axPlayer.next()") }
+            return .success
+        }
+        cc.previousTrackCommand.addTarget { [weak self] _ in
+            if !NativePlayer.shared.nativeAdvance(-1) { self?.js("window.axPlayer&&window.axPlayer.prev()") }
+            return .success
+        }
         cc.changePlaybackPositionCommand.addTarget { [weak self] e in
             let t = (e as? MPChangePlaybackPositionCommandEvent)?.positionTime ?? 0
             NativePlayer.shared.engageSeek(t)
@@ -287,6 +293,15 @@ final class NativePlayer: NSObject {
     private var title = ""
     private var artist = ""
     private var dur = 0.0
+    /* NATIVE QUEUE (2026-11-05): the page ships the list of downloaded items + their card
+       meta, and pre-streams the next playable file. Widget next/prev and auto-advance then
+       run 100% natively (iOS freezes page JS in the background - JS-dependent next/prev
+       did nothing from the lock screen). Wrap rule is his: #3 -> #1; single file replays. */
+    private var manifest: [[String: Any]] = []
+    private var mIndex = 0
+    private var curKey = ""
+    private var preBuf = Data()
+    private var preKey = ""
     weak var web: WKWebView?
 
     func attach(_ web: WKWebView) {
@@ -309,11 +324,29 @@ final class NativePlayer: NSObject {
             artist = (d["artist"] as? String) ?? ""
             dur = (d["dur"] as? Double) ?? 0
             artURL = (d["art"] as? String) ?? ""
+            curKey = (d["k"] as? String) ?? ""
             if let s = d["data"] as? String, let dd = Data(base64Encoded: s) { buf.append(dd) }
         case "chunk":
             if let s = d["data"] as? String, let dd = Data(base64Encoded: s) { buf.append(dd) }
         case "finish":
             load()
+        case "manifest":
+            manifest = (d["items"] as? [[String: Any]]) ?? []
+            if let i = d["index"] as? Int { mIndex = i }
+        case "pstart":
+            // preload stream: dropped if the file is already cached (dup preload is harmless)
+            let k = (d["k"] as? String) ?? ""
+            preBuf = Data()
+            preKey = FileManager.default.fileExists(atPath: trackURL(k).path) ? "" : k
+            if let s = d["data"] as? String, let dd = Data(base64Encoded: s), !preKey.isEmpty { preBuf.append(dd) }
+        case "pchunk":
+            if let s = d["data"] as? String, let dd = Data(base64Encoded: s), !preKey.isEmpty { preBuf.append(dd) }
+        case "pfinish":
+            if !preKey.isEmpty, !preBuf.isEmpty {
+                try? preBuf.write(to: trackURL(preKey), options: .atomic)
+            }
+            preKey = ""
+            pruneTrackCache()
         case "resume":
             claim()
             rewindIfEnded()
@@ -339,6 +372,14 @@ final class NativePlayer: NSObject {
         guard !buf.isEmpty else { emit("{type:'error'}"); return }
         let url = FileManager.default.temporaryDirectory.appendingPathComponent("ax-track.mp3")
         do { try buf.write(to: url, options: .atomic) } catch { emit("{type:'error'}"); return }
+        if !curKey.isEmpty { try? buf.write(to: trackURL(curKey), options: .atomic) }   // keyed copy: native replay/advance cache
+        attachPlayer(url)
+        if autoPlay { claim(); av?.play() }
+        card()
+        pruneTrackCache()
+    }
+
+    private func attachPlayer(_ url: URL) {
         if let o = timeObs, let p = av { p.removeTimeObserver(o) }
         rateObs?.invalidate()
         let player = AVPlayer(playerItem: AVPlayerItem(url: url))
@@ -351,8 +392,64 @@ final class NativePlayer: NSObject {
                                                  queue: .main) { [weak self] t in
             self?.tick(t.seconds)
         }
-        if autoPlay { claim(); player.play() }
+    }
+
+    /* Per-item cached file (from a handoff finish or a preload stream). */
+    private func trackURL(_ k: String) -> URL {
+        let safe = k.addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? k
+        return FileManager.default.temporaryDirectory.appendingPathComponent("ax-t-" + safe)
+    }
+
+    /* Keep the newest ~6 cached tracks; the currently playing file is never dropped. */
+    private func pruneTrackCache() {
+        let fm = FileManager.default
+        let dir = FileManager.default.temporaryDirectory
+        guard let files = try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: [.contentModificationDateKey]) else { return }
+        var tracks = files.filter { $0.lastPathComponent.hasPrefix("ax-t-") }
+        guard tracks.count > 6 else { return }
+        let curName = curKey.isEmpty ? "" : trackURL(curKey).lastPathComponent
+        tracks = tracks.filter { $0.lastPathComponent != curName }
+        let sorted = tracks.sorted { a, b in
+            let da = (try? a.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+            let db = (try? b.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+            return da > db
+        }
+        for f in sorted.suffix(from: 6) { try? fm.removeItem(at: f) }
+    }
+
+    /* Play a cached manifest item natively - no page JS involved. Syncs the page on wake
+       via the 'jump' event (queue index rides along). */
+    private func playFromCache(_ idx: Int) -> Bool {
+        guard idx >= 0, idx < manifest.count, let it = manifest[idx] as? [String: Any],
+              let k = it["k"] as? String else { return false }
+        let url = trackURL(k)
+        guard FileManager.default.fileExists(atPath: url.path) else { return false }
+        title = (it["t"] as? String) ?? "Track"
+        artist = (it["a"] as? String) ?? ""
+        dur = (it["d"] as? Double) ?? 0
+        artURL = (it["u"] as? String) ?? ""
+        curKey = k
+        mIndex = idx
+        attachPlayer(url)
+        claim()
+        av?.play()
         card()
+        pruneTrackCache()
+        emit("{type:'jump',i:\(idx),q:\(it["q"] as? Int ?? -1)}")
+        return true
+    }
+
+    /* Widget next/prev: native first (wrap always - his rule), page JS only as fallback
+       (app foreground), because the page is frozen when the app is backgrounded. */
+    func nativeAdvance(_ dir: Int) -> Bool {
+        guard engaged, !manifest.isEmpty else { return false }
+        if manifest.count == 1 {           // his rule: a single file answers by replaying itself
+            claim(); av?.seek(to: .zero); av?.play(); card(); return true
+        }
+        var idx = mIndex + dir
+        if idx >= manifest.count { idx = 0 }
+        if idx < 0 { idx = manifest.count - 1 }
+        return playFromCache(idx)
     }
 
     private func tick(_ t: Double) {
@@ -370,6 +467,10 @@ final class NativePlayer: NSObject {
 
     private func ended() {
         state(playing: false)
+        /* NATIVE AUTO-ADVANCE: the page is usually frozen when a track ends from the lock
+           screen, so its 'ended' JS can never run. Advance natively to the next CACHED
+           item; stop like Spotify at the end of the downloaded list (his no-press rule). */
+        if engaged, !manifest.isEmpty, mIndex + 1 < manifest.count, playFromCache(mIndex + 1) { return }
         emit("{type:'ended'}")
     }
 
