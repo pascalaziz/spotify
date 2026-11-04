@@ -302,6 +302,8 @@ final class NativePlayer: NSObject {
     private var curKey = ""
     private var preBuf = Data()
     private var preKey = ""
+    private var preLib = false
+    private var libKeys = Set<String>()
     weak var web: WKWebView?
 
     func attach(_ web: WKWebView) {
@@ -336,17 +338,29 @@ final class NativePlayer: NSObject {
         case "pstart":
             // preload stream: dropped if the file is already cached (dup preload is harmless)
             let k = (d["k"] as? String) ?? ""
+            let toLib = (d["lib"] as? Bool) ?? false
             preBuf = Data()
-            preKey = FileManager.default.fileExists(atPath: trackURL(k).path) ? "" : k
+            if toLib {
+                // LIBRARY stream REPLACES: a re-download means fresh bytes, never serve stale
+                preKey = k; preLib = true
+            } else {
+                preKey = FileManager.default.fileExists(atPath: trackURL(k).path) ? "" : k
+                preLib = false
+            }
             if let s = d["data"] as? String, let dd = Data(base64Encoded: s), !preKey.isEmpty { preBuf.append(dd) }
         case "pchunk":
             if let s = d["data"] as? String, let dd = Data(base64Encoded: s), !preKey.isEmpty { preBuf.append(dd) }
         case "pfinish":
             if !preKey.isEmpty, !preBuf.isEmpty {
-                try? preBuf.write(to: trackURL(preKey), options: .atomic)
+                try? preBuf.write(to: preLib ? libURL(preKey) : trackURL(preKey), options: .atomic)
+                if preLib { emit("{type:'mirrored',k:" + jsonStr(preKey) + "}") }
             }
             preKey = ""
+            preLib = false
             pruneTrackCache()
+        case "libsync":
+            libKeys = Set(((d["items"] as? [[String: Any]]) ?? []).compactMap { $0["k"] as? String })
+            libGC()
         case "resume":
             claim()
             rewindIfEnded()
@@ -372,7 +386,10 @@ final class NativePlayer: NSObject {
         guard !buf.isEmpty else { emit("{type:'error'}"); return }
         let url = FileManager.default.temporaryDirectory.appendingPathComponent("ax-track.mp3")
         do { try buf.write(to: url, options: .atomic) } catch { emit("{type:'error'}"); return }
-        if !curKey.isEmpty { try? buf.write(to: trackURL(curKey), options: .atomic) }   // keyed copy: native replay/advance cache
+        if !curKey.isEmpty {
+            try? buf.write(to: trackURL(curKey), options: .atomic)   // keyed copy: native replay/advance cache
+            try? buf.write(to: libURL(curKey), options: .atomic)     // library copy: persistent, survives restarts
+        }
         attachPlayer(url)
         if autoPlay { claim(); av?.play() }
         card()
@@ -400,6 +417,37 @@ final class NativePlayer: NSObject {
         return FileManager.default.temporaryDirectory.appendingPathComponent("ax-t-" + safe)
     }
 
+    /* NATIVE LIBRARY (2026-11-05, his order: "exact as Spotify, unlimited"): downloaded
+       files mirrored into the app's OWN storage (Application Support), so widget next/prev
+       reads native disk for ANY item - 3 or 100 - with zero page JS and zero dependence on
+       the frozen webview. Filled by the page's trickle while the app is open; persistent;
+       garbage-collected on libsync when items leave the queue. The 6-file rolling cache
+       (ax-t-*, temp dir) never touches these files. */
+    private func libName(_ k: String) -> String {
+        "ax-l-" + (k.addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? k)
+    }
+    private func libURL(_ k: String) -> URL {
+        let base = (try? FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask,
+                                                 appropriateFor: nil, create: true))
+            ?? FileManager.default.temporaryDirectory
+        let dir = base.appendingPathComponent("ax-library", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir.appendingPathComponent(libName(k))
+    }
+    private func libGC() {
+        let fm = FileManager.default
+        let dir = libURL("").deletingLastPathComponent()
+        guard let files = try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil) else { return }
+        for f in files where f.lastPathComponent.hasPrefix("ax-l-") {
+            let name = String(f.lastPathComponent.dropFirst(5))
+            let raw = name.removingPercentEncoding ?? name
+            if !libKeys.contains(raw) && !libKeys.contains(name) { try? fm.removeItem(at: f) }
+        }
+    }
+    private func jsonStr(_ s: String) -> String {
+        "\"" + s.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"") + "\""
+    }
+
     /* Keep the newest ~6 cached tracks; the currently playing file is never dropped. */
     private func pruneTrackCache() {
         let fm = FileManager.default
@@ -422,8 +470,14 @@ final class NativePlayer: NSObject {
     private func playFromCache(_ idx: Int) -> Bool {
         guard idx >= 0, idx < manifest.count, let it = manifest[idx] as? [String: Any],
               let k = it["k"] as? String else { return false }
-        let url = trackURL(k)
-        guard FileManager.default.fileExists(atPath: url.path) else { return false }
+        let url: URL
+        let cu = trackURL(k)
+        if FileManager.default.fileExists(atPath: cu.path) { url = cu }
+        else {
+            let lu = libURL(k)                                  // engine library: unlimited native jumps
+            guard FileManager.default.fileExists(atPath: lu.path) else { return false }
+            url = lu
+        }
         title = (it["t"] as? String) ?? "Track"
         artist = (it["a"] as? String) ?? ""
         dur = (it["d"] as? Double) ?? 0
