@@ -361,6 +361,40 @@ final class NativePlayer: NSObject {
         case "libsync":
             libKeys = Set(((d["items"] as? [[String: Any]]) ?? []).compactMap { $0["k"] as? String })
             libGC()
+        case "libquery":
+            // THE ENGINE'S DISK IS A SOURCE OF TRUTH (2026-11-05, user: "downloads are real files
+            // that die only with the app"). iOS may evict the page's web store under storage
+            // pressure, but this library's files (Application Support) persist until the app is
+            // deleted. The page asks which of these keys it can still play FROM DISK - badges,
+            // the on-device counter and the widget manifest then stay truthful even with an
+            // evicted web store. Reply echoes the asked keys so the page can cache negatives.
+            let ks = (d["ks"] as? [String]) ?? []
+            let fm = FileManager.default
+            let have = ks.filter { fm.fileExists(atPath: libURL($0).path) || fm.fileExists(atPath: trackURL($0).path) }
+            emit("{type:'libquery',have:[" + have.map(jsonStr).joined(separator: ",") + "],ks:[" + ks.map(jsonStr).joined(separator: ",") + "]}")
+        case "libplay":
+            // The page store lost the bytes but the engine's library still holds the real file:
+            // play it natively from disk - identical to a handoff, zero bytes transferred.
+            // attachPlayer sets engaged, so widget next/prev keeps working from this file too.
+            let k = (d["k"] as? String) ?? ""
+            if !k.isEmpty {
+                let fm = FileManager.default
+                var url: URL? = fm.fileExists(atPath: trackURL(k).path) ? trackURL(k) : nil
+                if url == nil { let lu = libURL(k); if fm.fileExists(atPath: lu.path) { url = lu } }
+                if let u = url {
+                    autoPlay = (d["play"] as? Bool) ?? true
+                    title = (d["title"] as? String) ?? "Track"
+                    artist = (d["artist"] as? String) ?? ""
+                    dur = (d["dur"] as? Double) ?? 0
+                    artURL = (d["art"] as? String) ?? ""
+                    curKey = k
+                    if let i = manifest.firstIndex(where: { ($0 as? [String: Any])?["k"] as? String == k }) { mIndex = i }
+                    attachPlayer(u)
+                    if autoPlay { claim(); av?.play() }
+                    card()
+                    pruneTrackCache()
+                }
+            }
         case "resume":
             claim()
             rewindIfEnded()
