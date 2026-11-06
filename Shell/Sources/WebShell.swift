@@ -114,6 +114,7 @@ final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptM
     weak var web: WKWebView?
     var refresh: UIRefreshControl?
     private var offlineShown = false
+    private var offlineTriedCache = false
     private var remoteConfigured = false
 
     func attach(_ web: WKWebView) {
@@ -180,6 +181,7 @@ final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptM
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         refresh?.endRefreshing()
         offlineShown = false
+        offlineTriedCache = false
     }
 
     func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
@@ -192,8 +194,22 @@ final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptM
         showOffline()
     }
 
+    /* NATIVE OFFLINE BOOT (2026-11-05, his order: the app must open with no network). Apple gives
+       WKWebView no service worker (measured api=0 on the phone), so the WebView's own HTTP cache is
+       the only store this app owns. When a navigation fails, FIRST re-ask for the document with
+       cachePolicy .returnCacheDataDontLoad: the last stored copy is served with zero network and
+       zero expiry (the HTTP max-age window no longer applies). Only when nothing is cached does the
+       generic offline card appear. didFinish resets both flags. */
     private func showOffline() {
-        guard let web = web, SHELL.url != nil, !offlineShown else { return }
+        guard let web = web, let url = SHELL.url else { return }
+        if !offlineTriedCache {
+            offlineTriedCache = true
+            var req = URLRequest(url: url)
+            req.cachePolicy = .returnCacheDataDontLoad
+            web.load(req)
+            return
+        }
+        guard !offlineShown else { return }
         offlineShown = true
         web.loadHTMLString(Self.offlineHTML, baseURL: nil)
     }
@@ -202,6 +218,7 @@ final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptM
                                didReceive message: WKScriptMessage) {
         if message.name == "shellRetry" {
             offlineShown = false
+            offlineTriedCache = false
             if let url = SHELL.url { web?.load(URLRequest(url: url)) }
         }
         if message.name == "axPlay", let d = message.body as? [String: Any] {
