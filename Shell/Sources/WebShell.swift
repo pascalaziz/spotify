@@ -382,6 +382,14 @@ final class NativePlayer: NSObject {
         let safe = key.addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? key
         return artDir().appendingPathComponent("ax-a-" + safe + ".img")
     }
+    /* CHEAP "IS IT SAVED?" (2026-11-08). diskArt DECODES the image; the queue and the guards only
+       need to know whether a file is there. With a 200-item library the old check would have decoded
+       200 covers on the main thread every time the library was re-sent - a visible hitch for no
+       benefit. Existence is a stat() call. */
+    private func hasArt(_ key: String) -> Bool {
+        guard !key.isEmpty else { return false }
+        return FileManager.default.fileExists(atPath: artDiskURL(key).path)
+    }
     private func diskArt(_ key: String) -> UIImage? {
         guard !key.isEmpty else { return nil }
         let u = artDiskURL(key)
@@ -797,7 +805,7 @@ final class NativePlayer: NSObject {
        thumbnail URL later changes, and it survives relaunch and airplane mode. */
     private func fetchArt(url u: String, key k: String, thenRefreshCard: Bool) {
         guard !u.isEmpty, !k.isEmpty, !artFailed.contains(u),
-              diskArt(k) == nil,
+              !hasArt(k),
               artCache.object(forKey: u as NSString) == nil,
               artFetchURL != u,
               let url = URL(string: u) else { return }
@@ -827,7 +835,7 @@ final class NativePlayer: NSObject {
             if n >= 6 { break }
             let k = (it["k"] as? String) ?? ""
             let u = (it["u"] as? String) ?? ""
-            guard !k.isEmpty, !u.isEmpty, diskArt(k) == nil, !artFailed.contains(u) else { continue }
+            guard !k.isEmpty, !u.isEmpty, !hasArt(k), !artFailed.contains(u) else { continue }
             n += 1
             fetchArt(url: u, key: k, thenRefreshCard: false)
         }
@@ -839,7 +847,7 @@ final class NativePlayer: NSObject {
         guard !artBusy else { return }
         while let next = artQueue.first {
             artQueue.removeFirst()
-            if diskArt(next.0) != nil || artFailed.contains(next.1) { continue }
+            if hasArt(next.0) || artFailed.contains(next.1) { continue }
             artBusy = true
             fetchArtQueued(url: next.1, key: next.0) { [weak self] ok in
                 guard let self = self else { return }
