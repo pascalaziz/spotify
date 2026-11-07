@@ -358,6 +358,29 @@ final class NativePlayer: NSObject {
     private var artFetchURL = ""
     private var artFailed = Set<String>()
     private let artCache = NSCache<NSString, UIImage>()
+    /* ARTWORK ON DISK (2026-11-08, his report: the lock-screen widget shows the brand image instead
+       of the track's own cover). The image was only ever held in an NSCache, so a downloaded track
+       played offline had nothing to draw and fell back to the bundled brand art - exactly what he
+       photographed. Each cover is now written next to the library files under its track key, which
+       makes it permanent: fetched once online, used forever, offline included. */
+    private func artDir() -> URL {
+        let base = (try? FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask,
+                                                 appropriateFor: nil, create: true))
+            ?? FileManager.default.temporaryDirectory
+        let d = base.appendingPathComponent("ax-art", isDirectory: true)
+        try? FileManager.default.createDirectory(at: d, withIntermediateDirectories: true)
+        return d
+    }
+    private func artDiskURL(_ key: String) -> URL {
+        let safe = key.addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? key
+        return artDir().appendingPathComponent("ax-a-" + safe + ".img")
+    }
+    private func diskArt(_ key: String) -> UIImage? {
+        guard !key.isEmpty else { return nil }
+        let u = artDiskURL(key)
+        guard FileManager.default.fileExists(atPath: u.path) else { return nil }
+        return UIImage(contentsOfFile: u.path)
+    }
     private var title = ""
     private var artist = ""
     private var dur = 0.0
@@ -403,6 +426,11 @@ final class NativePlayer: NSObject {
         case "manifest":
             manifest = (d["items"] as? [[String: Any]]) ?? []
             if let i = d["index"] as? Int { mIndex = i }
+            /* A FRESH MANIFEST MEANS THE PAGE IS ALIVE AND ONLINE - so this is the moment to retry
+               any cover that failed earlier in this launch, and to pull the queue's artwork to disk
+               before it is needed offline. */
+            artFailed.removeAll()
+            prefetchArt(manifest)
         case "pstart":
             // preload stream: dropped if the file is already cached (dup preload is harmless)
             let k = (d["k"] as? String) ?? ""
@@ -587,6 +615,17 @@ final class NativePlayer: NSObject {
             let raw = name.removingPercentEncoding ?? name
             if !libKeys.contains(raw) && !libKeys.contains(name) { try? fm.removeItem(at: f) }
         }
+        /* COVERS FOLLOW THEIR TRACKS (2026-11-08). The art cache is per key, so without this it
+           would grow forever as playlists change. Same rule as the library files: anything whose
+           key is no longer in the queue is removed. One GC, two directories. */
+        if let artFiles = try? fm.contentsOfDirectory(at: artDir(), includingPropertiesForKeys: nil) {
+            for f in artFiles where f.lastPathComponent.hasPrefix("ax-a-") {
+                var name = String(f.lastPathComponent.dropFirst(5))
+                if name.hasSuffix(".img") { name = String(name.dropLast(4)) }
+                let raw = name.removingPercentEncoding ?? name
+                if !libKeys.contains(raw) && !libKeys.contains(name) { try? fm.removeItem(at: f) }
+            }
+        }
     }
     private func jsonStr(_ s: String) -> String {
         "\"" + s.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"") + "\""
@@ -716,26 +755,60 @@ final class NativePlayer: NSObject {
     private lazy var defaultArt: UIImage? = UIImage(named: "nowplaying")
 
     private func currentArt() -> UIImage? {
+        /* DISK FIRST (2026-11-08): a cover already saved for this track is the truth, and it is the
+           only thing that can work with no network. Then the memory cache for the current URL. */
+        if let img = diskArt(curKey) {
+            if !artURL.isEmpty { artCache.setObject(img, forKey: artURL as NSString) }
+            return img
+        }
         if !artURL.isEmpty, let img = artCache.object(forKey: artURL as NSString) { return img }
         return defaultArt
     }
 
     private func maybeFetchArt() {
-        let u = artURL
-        guard !u.isEmpty, !artFailed.contains(u),
-              artCache.object(forKey: u as NSString) == nil, artFetchURL != u,
+        fetchArt(url: artURL, key: curKey, thenRefreshCard: true)
+    }
+
+    /* ONE fetch path for both the current track and the prefetch sweep. Success is written to disk
+       under the TRACK KEY (not the URL), so the same cover is found again by key even if the
+       thumbnail URL later changes, and it survives relaunch and airplane mode. */
+    private func fetchArt(url u: String, key k: String, thenRefreshCard: Bool) {
+        guard !u.isEmpty, !k.isEmpty, !artFailed.contains(u),
+              diskArt(k) == nil,
+              artCache.object(forKey: u as NSString) == nil,
+              artFetchURL != u,
               let url = URL(string: u) else { return }
         artFetchURL = u
         URLSession.shared.dataTask(with: url) { [weak self] data, _, _ in
             guard let data = data, let img = UIImage(data: data) else {
-                // ONE attempt per URL: offline/dead thumbnails must not re-fetch on
-                // every card() tick (0.5s while playing). The bundled art stands in.
+                // ONE attempt per URL per launch: offline/dead thumbnails must not re-fetch on
+                // every card() tick (0.5s while playing).
                 DispatchQueue.main.async { self?.artFailed.insert(u); self?.artFetchURL = "" }
                 return
             }
+            try? data.write(to: self?.artDiskURL(k) ?? URL(fileURLWithPath: "/dev/null"), options: .atomic)
             self?.artCache.setObject(img, forKey: u as NSString)
-            DispatchQueue.main.async { self?.artFetchURL = ""; self?.card() }
+            DispatchQueue.main.async {
+                self?.artFetchURL = ""
+                if thenRefreshCard { self?.card() }
+            }
         }.resume()
+    }
+
+    /* PRE-FETCH THE QUEUE'S COVERS (2026-11-08). Waiting until a track is played means the one cover
+       that matters (the next one the widget will show) may never have been fetched while there was
+       a network. When the page ships a manifest, the first few covers are pulled to disk in the
+       background - bounded, sequential, and skipped for anything already saved. */
+    private func prefetchArt(_ items: [[String: Any]]) {
+        var n = 0
+        for it in items {
+            if n >= 6 { break }
+            let k = (it["k"] as? String) ?? ""
+            let u = (it["u"] as? String) ?? ""
+            guard !k.isEmpty, !u.isEmpty, diskArt(k) == nil, !artFailed.contains(u) else { continue }
+            n += 1
+            fetchArt(url: u, key: k, thenRefreshCard: false)
+        }
     }
 
     // Direct widget paths: the engine answers play/pause/seek INSTANTLY, even if the
