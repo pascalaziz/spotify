@@ -463,10 +463,12 @@ final class NativePlayer: NSObject {
                 card()
             }
         case "release":
-            // the page moved to a web-path track (video/embed/link): stand down fully
-            av?.pause()
-            engaged = false
-            MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
+            /* THE PAGE CLOSED THE PLAYER: THE OS CARD MUST GO WITH IT (2026-11-07, his report:
+               closing the mp3/mp4 left the lock-screen widget sitting there). Clearing
+               nowPlayingInfo alone does NOT dismiss it - iOS keeps the card while the audio
+               session is still active and the remote commands still answer. So this is a full
+               stand-down: stop, clear, mark stopped, hand the session back, drop the commands. */
+            releaseAll()
         default:
             break
         }
@@ -677,6 +679,10 @@ final class NativePlayer: NSObject {
     }
 
     private func card() {
+        /* NEVER RESTATE A CARD AFTER A RELEASE (2026-11-07). releaseAll() sets engaged = false and
+           drops the player; without this guard a late tick or a state event would republish an
+           EMPTY nowPlayingInfo and pop the widget straight back up after he closed it. */
+        guard engaged, av != nil else { return }
         var info: [String: Any] = [:]
         info[MPMediaItemPropertyTitle] = title
         info[MPMediaItemPropertyArtist] = artist
@@ -687,6 +693,9 @@ final class NativePlayer: NSObject {
             info[MPMediaItemPropertyArtwork] = MPMediaItemArtwork(boundsSize: img.size) { _ in img }
         }
         MPNowPlayingInfoCenter.default().nowPlayingInfo = info
+        /* The card's own state, stated in the same place the info is: playing while the player
+           runs, paused while it is held. This is what makes the widget's buttons match the audio. */
+        MPNowPlayingInfoCenter.default().playbackState = ((av?.rate ?? 0) > 0) ? .playing : .paused
         maybeFetchArt()
     }
 
@@ -731,6 +740,38 @@ final class NativePlayer: NSObject {
         let s = AVAudioSession.sharedInstance()
         try? s.setCategory(.playback, mode: .default)
         try? s.setActive(true)
+        setCommands(true)   // a released player disabled them; any new track re-enables them
+    }
+
+    /* ============ THE STAND-DOWN THAT ACTUALLY DISMISSES THE CARD ============
+       2026-11-07. Closing the player must also close the lock-screen widget - they are one thing
+       to the user. On iOS the card is not driven by nowPlayingInfo alone: it survives while the
+       audio session is active AND while the remote commands still report themselves as available.
+       So a real close does all four: stop and drop the player, clear the info, declare the state
+       stopped, deactivate the session, and disable the five commands. setCommands(true) in
+       claim() puts them back the moment any track starts again. */
+    private func releaseAll() {
+        av?.pause()
+        av = nil
+        engaged = false
+        title = ""; artist = ""; dur = 0; curKey = ""; artURL = ""
+        MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
+        MPNowPlayingInfoCenter.default().playbackState = .stopped
+        setCommands(false)
+        let s = AVAudioSession.sharedInstance()
+        try? s.setActive(false, options: .notifyOthersOnDeactivation)
+    }
+
+    private var commandsOn = true
+    private func setCommands(_ on: Bool) {
+        guard commandsOn != on else { return }
+        commandsOn = on
+        let cc = MPRemoteCommandCenter.shared()
+        cc.playCommand.isEnabled = on
+        cc.pauseCommand.isEnabled = on
+        cc.nextTrackCommand.isEnabled = on
+        cc.previousTrackCommand.isEnabled = on
+        cc.changePlaybackPositionCommand.isEnabled = on
     }
 
     // Interruption began (another app took the audio): pause deterministically, card alive.
