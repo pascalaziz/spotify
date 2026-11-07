@@ -580,6 +580,17 @@ final class NativePlayer: NSObject {
         card()
         pruneTrackCache()
         emit("{type:'jump',i:\(idx),q:\(it["q"] as? Int ?? -1),k:\(jsonStr(k))}")
+        /* ADVANCE DIAGNOSTIC (2026-11-07, his report: the widget changes track but stays SILENT).
+           The card updating proves this function ran and found a file, so the failure is after it -
+           either the file is incomplete, the player errored, or play() never took. Report the file,
+           its size, the item's error and the player's rate once it has had time to start. */
+        let sz = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? Int) ?? 0
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.9) { [weak self] in
+            let r = self?.av?.rate ?? -1
+            let err = self?.av?.currentItem?.error?.localizedDescription ?? ""
+            let st = self?.av?.currentItem?.status.rawValue ?? -1
+            self?.emit("{type:'advdiag',idx:\(idx),k:\(jsonStr(k)),size:\(sz ?? 0),rate:\(r),st:\(st),err:\(jsonStr(err))}")
+        }
         return true
     }
 
