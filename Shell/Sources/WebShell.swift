@@ -117,6 +117,39 @@ final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptM
     private var offlineTriedCache = false
     private var remoteConfigured = false
 
+    /* NATIVE DOCUMENT SNAPSHOT (2026-11-07) — the real offline boot.
+       WHY THE PREVIOUS FIX WAS NOT ENOUGH: it relied on WKWebView's HTTP cache to answer a
+       main-frame navigation with .returnCacheDataDontLoad. Measured on the phone: the chip said
+       "offline ready" (the page cannot know) while an offline reopen failed outright — WKWebView
+       does not reliably serve a cached MAIN FRAME, whatever the policy. So the shell keeps its OWN
+       copy of the document: the rendered HTML after every good load, written to Application
+       Support. Offline, that file IS the app. Deterministic, no HTTP-cache semantics involved,
+       survives relaunches and app updates until deleted. window.__AX_SHELL_SNAPSHOT tells the page
+       the truth, so the chip can only claim "ready" when this copy genuinely exists. */
+    private static var snapshotURL: URL {
+        let base = (try? FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask,
+                                                 appropriateFor: nil, create: true))
+            ?? FileManager.default.temporaryDirectory
+        return base.appendingPathComponent("ax-shell.html")
+    }
+
+    private func saveSnapshot() {
+        guard let web = web, SHELL.url != nil else { return }
+        web.evaluateJavaScript("document.documentElement.outerHTML") { result, _ in
+            guard let html = result as? String, html.count > 500 else { return }
+            try? html.write(to: Self.snapshotURL, atomically: true, encoding: .utf8)
+        }
+    }
+
+    /// Serve the stored document. `true` means the app is on screen, not an error card.
+    private func loadSnapshot() -> Bool {
+        guard let html = try? String(contentsOf: Self.snapshotURL, encoding: .utf8), html.count > 500 else { return false }
+        offlineShown = true                     // never fall through to the error card afterwards
+        web?.evaluateJavaScript("window.__AX_SHELL_SNAPSHOT=1", completionHandler: nil)
+        web?.loadHTMLString(html, baseURL: SHELL.url)
+        return true
+    }
+
     func attach(_ web: WKWebView) {
         self.web = web
         web.configuration.userContentController.add(self, name: "shellRetry")
@@ -182,6 +215,8 @@ final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptM
         refresh?.endRefreshing()
         offlineShown = false
         offlineTriedCache = false
+        // A good load is the moment the document is worth keeping for the offline boot.
+        saveSnapshot()
     }
 
     func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
@@ -209,6 +244,10 @@ final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptM
             web.load(req)
             return
         }
+        /* THE DETERMINISTIC PATH: the shell's own document copy (see snapshotURL). This is what
+           actually opens the app with no network - the HTTP-cache attempt above is only a
+           best-effort first try and is known not to be honoured for a main frame. */
+        if loadSnapshot() { return }
         guard !offlineShown else { return }
         offlineShown = true
         web.loadHTMLString(Self.offlineHTML, baseURL: nil)
