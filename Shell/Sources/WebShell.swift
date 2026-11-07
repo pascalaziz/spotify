@@ -501,10 +501,11 @@ final class NativePlayer: NSObject {
         }
     }
 
-    /* Per-item cached file (from a handoff finish or a preload stream). */
+    /* Per-item cached file (from a handoff finish or a preload stream). Extension REQUIRED - see
+       mediaExt above: AVPlayer refuses an extensionless file with "Cannot Open". */
     private func trackURL(_ k: String) -> URL {
         let safe = k.addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? k
-        return FileManager.default.temporaryDirectory.appendingPathComponent("ax-t-" + safe)
+        return FileManager.default.temporaryDirectory.appendingPathComponent("ax-t-" + safe + "." + mediaExt(k))
     }
 
     /* NATIVE LIBRARY (2026-11-05, his order: "exact as Spotify, unlimited"): downloaded
@@ -513,8 +514,28 @@ final class NativePlayer: NSObject {
        the frozen webview. Filled by the page's trickle while the app is open; persistent;
        garbage-collected on libsync when items leave the queue. The 6-file rolling cache
        (ax-t-*, temp dir) never touches these files. */
+    /* THE FILE NAME MUST CARRY ITS CONTAINER EXTENSION (2026-11-07, root cause of his silent widget).
+       libName/trackURL wrote `ax-l-<key>` with NO suffix. The bytes were all there (his diag:
+       size=844604) but AVPlayerItem(url:) infers the container from the extension, so an
+       extensionless file fails with exactly "Cannot Open" - the card updated and the audio never
+       started. Derive .mp3/.mp4/.m4a from the key (the downloader keys end in `_mp3_best` /
+       `_mp4_best` / `_<fmt>`), and fall back to sniffing the first bytes so an unusual key still
+       plays. Everything else about the stream is unchanged. */
+    private func mediaExt(_ k: String, firstBytes: Data? = nil) -> String {
+        let low = k.lowercased()
+        if low.contains("_mp4") || low.hasSuffix("mp4") { return "mp4" }
+        if low.contains("_m4a") || low.hasSuffix("m4a") { return "m4a" }
+        if low.contains("_mp3") || low.hasSuffix("mp3") { return "mp3" }
+        if let b = firstBytes, b.count >= 12 {
+            let h = [UInt8](b.prefix(12))
+            if h[4] == 0x66 && h[5] == 0x74 && h[6] == 0x79 && h[7] == 0x70 { return "mp4" }   // ftyp
+            if h[0] == 0x49 && h[1] == 0x44 && h[2] == 0x33 { return "mp3" }                    // ID3
+            if h[0] == 0xFF && (h[1] & 0xE0) == 0xE0 { return "mp3" }                            // frame sync
+        }
+        return "mp3"
+    }
     private func libName(_ k: String) -> String {
-        "ax-l-" + (k.addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? k)
+        "ax-l-" + (k.addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? k) + "." + mediaExt(k)
     }
     private func libURL(_ k: String) -> URL {
         let base = (try? FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask,
@@ -522,14 +543,33 @@ final class NativePlayer: NSObject {
             ?? FileManager.default.temporaryDirectory
         let dir = base.appendingPathComponent("ax-library", isDirectory: true)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        return dir.appendingPathComponent(libName(k))
+        let named = dir.appendingPathComponent(libName(k))
+        if FileManager.default.fileExists(atPath: named.path) { return named }
+        /* FILES MIRRORED BEFORE THE EXTENSION FIX MUST STILL PLAY (2026-11-07). Builds up to
+           1.51.0 wrote `ax-l-<key>` with no suffix, so his existing mirror is all extensionless.
+           Rename it to the correct name on first use instead of re-downloading: same bytes, now
+           openable. Reads the old path only when the new one is absent, so nothing is lost. */
+        let old = dir.appendingPathComponent("ax-l-" + (k.addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? k))
+        if FileManager.default.fileExists(atPath: old.path) {
+            try? FileManager.default.moveItem(at: old, to: named)
+            if FileManager.default.fileExists(atPath: named.path) { return named }
+        }
+        return named
     }
     private func libGC() {
         let fm = FileManager.default
         let dir = libURL("").deletingLastPathComponent()
         guard let files = try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil) else { return }
         for f in files where f.lastPathComponent.hasPrefix("ax-l-") {
-            let name = String(f.lastPathComponent.dropFirst(5))
+            var name = String(f.lastPathComponent.dropFirst(5))
+            /* THE EXTENSION IS NOT PART OF THE KEY (2026-11-07). Names now end in .mp3/.mp4, and
+               comparing the full name against libKeys (which holds bare keys) matched NOTHING - so
+               every mirrored file would have been garbage-collected on the next libsync. Strip the
+               suffix first; also tolerate the pre-fix extensionless names. */
+            if let dot = name.lastIndex(of: "."), name.distance(from: name.startIndex, to: dot) > 0 {
+                let ext = name[name.index(after: dot)...].lowercased()
+                if ext == "mp3" || ext == "mp4" || ext == "m4a" { name = String(name[..<dot]) }
+            }
             let raw = name.removingPercentEncoding ?? name
             if !libKeys.contains(raw) && !libKeys.contains(name) { try? fm.removeItem(at: f) }
         }
