@@ -44,7 +44,7 @@ struct ShellWebView: UIViewRepresentable {
         // Tell the page it runs inside the native shell (native background audio exists,
         // so the web-side keep-alive workaround is disabled there).
         config.userContentController.addUserScript(
-            WKUserScript(source: "window.__AX_NATIVE=1;",
+            WKUserScript(source: "window.__AX_NATIVE=1;window.__AX_APP_VER='" + Self.appVersion() + "';",
                          injectionTime: .atDocumentStart,
                          forMainFrameOnly: true))
         // Media bridge: control/event helpers. The page's player stays the brain (queue, UI,
@@ -84,6 +84,18 @@ struct ShellWebView: UIViewRepresentable {
 
     // Runs in the page from document-start. Small control/event surface for the native
     // audio engine: the page sends commands, the engine sends state.
+    /* THE INSTALLED BUILD, FOR THE ADMIN WHO IS TESTING (2026-11-07, his order: the drawer must
+       show the app version, owner/admin only, "so we know we downloaded the correct version").
+       Read from the bundle so it can never disagree with the binary that is actually running -
+       the page-side build token only proves which JS loaded, never which IPA is installed.
+       Plain string, injected with __AX_NATIVE in one script: no new bridge, no new handler. */
+    static func appVersion() -> String {
+        let i = Bundle.main.infoDictionary
+        let short = (i?["CFBundleShortVersionString"] as? String) ?? "?"
+        let build = (i?["CFBundleVersion"] as? String) ?? "?"
+        return short + " (" + build + ")"
+    }
+
     static let mediaBridgeJS = """
     (function () {
       if (!window.__AX_NATIVE) return;
