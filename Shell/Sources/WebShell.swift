@@ -363,6 +363,13 @@ final class NativePlayer: NSObject {
        played offline had nothing to draw and fell back to the bundled brand art - exactly what he
        photographed. Each cover is now written next to the library files under its track key, which
        makes it permanent: fetched once online, used forever, offline included. */
+    /* A WORK QUEUE FOR COVERS (2026-11-08, his report: "you fixed it for 1 mp3 only however it must
+       for all downloaded mp3/mp4"). Fetching art only when a track was played meant one cover per
+       session. The page now ships the whole library's key+url pairs, and this drains them one at a
+       time in the background: sequential on purpose, so a big library never opens 40 sockets at once
+       and never competes with the audio stream for bandwidth. */
+    private var artQueue: [(String, String)] = []
+    private var artBusy = false
     private func artDir() -> URL {
         let base = (try? FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask,
                                                  appropriateFor: nil, create: true))
@@ -431,6 +438,16 @@ final class NativePlayer: NSObject {
                before it is needed offline. */
             artFailed.removeAll()
             prefetchArt(manifest)
+        case "artprefetch":
+            /* THE WHOLE DOWNLOADED LIBRARY (2026-11-08). Items already on disk are skipped by the
+               drain, so a repeat call costs nothing. */
+            let arr = (d["items"] as? [[String: Any]]) ?? []
+            artQueue = arr.compactMap { it -> (String, String)? in
+                guard let k = it["k"] as? String, let u = it["u"] as? String,
+                      !k.isEmpty, !u.isEmpty else { return nil }
+                return (k, u)
+            }
+            drainArt()
         case "pstart":
             // preload stream: dropped if the file is already cached (dup preload is harmless)
             let k = (d["k"] as? String) ?? ""
@@ -792,8 +809,7 @@ final class NativePlayer: NSObject {
                 DispatchQueue.main.async { self?.artFailed.insert(u); self?.artFetchURL = "" }
                 return
             }
-            try? data.write(to: self?.artDiskURL(k) ?? URL(fileURLWithPath: "/dev/null"), options: .atomic)
-            self?.artCache.setObject(img, forKey: u as NSString)
+            if let self = self { self.storeArt(data, img: img, key: k, url: u) }
             DispatchQueue.main.async {
                 self?.artFetchURL = ""
                 if thenRefreshCard { self?.card() }
@@ -815,6 +831,43 @@ final class NativePlayer: NSObject {
             n += 1
             fetchArt(url: u, key: k, thenRefreshCard: false)
         }
+    }
+
+    /* Drain the library queue one cover at a time. Anything already saved (or already failed this
+       launch) is skipped without a network call, so re-sending the library is cheap. */
+    private func drainArt() {
+        guard !artBusy else { return }
+        while let next = artQueue.first {
+            artQueue.removeFirst()
+            if diskArt(next.0) != nil || artFailed.contains(next.1) { continue }
+            artBusy = true
+            fetchArtQueued(url: next.1, key: next.0) { [weak self] ok in
+                guard let self = self else { return }
+                self.artBusy = false
+                if ok, self.curKey == next.0 { self.card() }   // the widget is showing this one
+                self.drainArt()
+            }
+            return
+        }
+    }
+
+    private func fetchArtQueued(url u: String, key k: String, done: @escaping (Bool) -> Void) {
+        guard let url = URL(string: u) else { done(false); return }
+        URLSession.shared.dataTask(with: url) { [weak self] data, _, _ in
+            guard let self = self else { done(false); return }
+            guard let data = data, let img = UIImage(data: data) else {
+                DispatchQueue.main.async { self.artFailed.insert(u); done(false) }
+                return
+            }
+            self.storeArt(data, img: img, key: k, url: u)
+            DispatchQueue.main.async { done(true) }
+        }.resume()
+    }
+
+    /* One writer for both paths: disk under the track key, plus the memory cache keyed by URL. */
+    private func storeArt(_ data: Data, img: UIImage, key: String, url: String) {
+        try? data.write(to: artDiskURL(key), options: .atomic)
+        artCache.setObject(img, forKey: url as NSString)
     }
 
     // Direct widget paths: the engine answers play/pause/seek INSTANTLY, even if the
