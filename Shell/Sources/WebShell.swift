@@ -579,7 +579,7 @@ final class NativePlayer: NSObject {
         av?.play()
         card()
         pruneTrackCache()
-        emit("{type:'jump',i:\(idx),q:\(it["q"] as? Int ?? -1)}")
+        emit("{type:'jump',i:\(idx),q:\(it["q"] as? Int ?? -1),k:\(jsonStr(k))}")
         return true
     }
 
