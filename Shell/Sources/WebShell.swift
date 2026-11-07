@@ -600,6 +600,12 @@ final class NativePlayer: NSObject {
     }
     private func libGC() {
         let fm = FileManager.default
+        /* NEVER SWEEP ON AN EMPTY KEY SET (2026-11-08). libsync carries the page's list; a transient
+           empty or half-built list would otherwise delete EVERY library file - and now every saved
+           cover - because "not in libKeys" is true for all of them. His standing rule is that
+           downloads are real files that die only with the app, so an empty list means "no
+           information", never "delete everything". */
+        guard !libKeys.isEmpty else { return }
         let dir = libURL("").deletingLastPathComponent()
         guard let files = try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil) else { return }
         for f in files where f.lastPathComponent.hasPrefix("ax-l-") {
