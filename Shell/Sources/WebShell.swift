@@ -1176,12 +1176,11 @@ extension AxDownloads: URLSessionDownloadDelegate, URLSessionDataDelegate {
         guard let err = error else { return }
         let key = task.taskDescription ?? ""
         guard !key.isEmpty else { return }
-        let resume = (task as? URLSessionDownloadTask)?.resumeData
         DispatchQueue.main.async {
-            /* Clear the meta so a page retry can hand the job again immediately; URLSession
+            /* Clear the meta so a page retry can hand the job again immediately. URLSession
                itself already retried transient failures (waitsForConnectivity), so what reaches
-               here is a real error. Resume data is kept for future byte-wise restarts. */
-            if let resume = resume { UserDefaults.standard.set(resume, forKey: "ax.bg.resume." + key) }
+               here is a real error; the retry re-serves the SAME server job (the dir survives
+               partial serves), so nothing is lost. */
             self.clearMeta(key)
             self.emit(key: key, type: "error", got: 0, total: 0,
                       msg: err.localizedDescription)
