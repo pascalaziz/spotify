@@ -194,6 +194,12 @@ final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptM
         web.configuration.userContentController.add(self, name: "axBg")
         NativePlayer.shared.attach(web)
         AxDownloads.shared.attachWeb(web)
+        NativePlayer.shared.refreshBrandArt(shellHost: SHELL_HOST)
+        NotificationCenter.default.addObserver(forName: UIApplication.willEnterForegroundNotification,
+                                               object: nil, queue: .main) { [weak self] _ in
+            guard self?.web != nil else { return }
+            NativePlayer.shared.refreshBrandArt(shellHost: SHELL_HOST)
+        }
         configureRemoteCommandsIfNeeded()
         // Interruptions (calls, other apps' audio): on .began pause deterministically and
         // keep the card; on .ended re-claim the session + card but never auto-resume -
@@ -833,6 +839,13 @@ final class NativePlayer: NSObject {
     // Artwork: the track's thumbnail (page-sent URL, cached) with the bundled brand
     // art as the standing fallback. Fetch is async; the card is restated on arrival.
     private lazy var defaultArt: UIImage? = UIImage(named: "nowplaying")
+    /* ADMIN BRAND AS THE NATIVE FALLBACK ART (2026-11-15): "branding everywhere". The app's own
+       artwork fallback tracks the logo configured in Admin -> Website Details: fetched from
+       brand.json on launch/foreground, cached on disk (ax-library/ax-brand-logo.png), swapped ONLY
+       after a successful image decode, and never shown while the track has its own cover. The
+       bundled nowplaying.png stays the final fallback (first-ever offline run). */
+    private var brandArt: UIImage?
+    private var brandFetchedURL = ""
 
     private func currentArt() -> UIImage? {
         /* DISK FIRST (2026-11-08): a cover already saved for this track is the truth, and it is the
@@ -842,7 +855,38 @@ final class NativePlayer: NSObject {
             return img
         }
         if !artURL.isEmpty, let img = artCache.object(forKey: artURL as NSString) { return img }
+        if let b = brandArt { return b }
         return defaultArt
+    }
+
+    /* One light refresh: brand.json is tiny and no-store; the image itself is only re-downloaded
+       when its URL actually changed (the site cache-busts it with ?v=content-hash). Failures are
+       silent: the bundled art (or last cached brand art) keeps standing in. */
+    func refreshBrandArt(shellHost: String) {
+        guard !shellHost.isEmpty,
+              let url = URL(string: "https://" + shellHost + "/brand.json") else { return }
+        URLSession.shared.dataTask(with: url) { [weak self] data, _, _ in
+            guard let self = self, let data = data,
+                  let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+                  let logo = obj["logo"] as? String, !logo.isEmpty else { return }
+            guard logo != self.brandFetchedURL else { return }
+            self.brandFetchedURL = logo
+            guard let iu = URL(string: logo) else { return }
+            URLSession.shared.dataTask(with: iu) { [weak self] imgData, _, _ in
+                guard let self = self, let imgData = imgData,
+                      imgData.count > 512, let img = UIImage(data: imgData) else { return }
+                let fm = FileManager.default
+                let base = (try? fm.url(for: .applicationSupportDirectory, in: .userDomainMask,
+                                        appropriateFor: nil, create: true)) ?? fm.temporaryDirectory
+                let dir = base.appendingPathComponent("ax-library", isDirectory: true)
+                try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
+                try? imgData.write(to: dir.appendingPathComponent("ax-brand-logo.png"), options: .atomic)
+                DispatchQueue.main.async {
+                    self.brandArt = img
+                    self.card()
+                }
+            }.resume()
+        }.resume()
     }
 
     private func maybeFetchArt() {
