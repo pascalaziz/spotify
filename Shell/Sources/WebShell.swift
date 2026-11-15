@@ -55,6 +55,14 @@ struct ShellWebView: UIViewRepresentable {
             WKUserScript(source: Self.mediaBridgeJS,
                          injectionTime: .atDocumentStart,
                          forMainFrameOnly: true))
+        // Download bridge: the page hands a ready yt-dlp job (action=serve URL) to the app's
+        // background URLSession; iOS transfers it even while the app is suspended. Events come
+        // back as 'axbg' CustomEvents; progress only while foreground (page JS is frozen anyway),
+        // and a full sync rides UIApplicationWillEnterForeground so the queue can reconcile.
+        config.userContentController.addUserScript(
+            WKUserScript(source: Self.downloadBridgeJS,
+                         injectionTime: .atDocumentStart,
+                         forMainFrameOnly: true))
         // default (persistent) data store: cookies + IndexedDB + OPFS survive relaunches,
         // Service Workers run in-app on iOS 16.4+.
         let web = WKWebView(frame: .zero, configuration: config)
@@ -104,6 +112,23 @@ struct ShellWebView: UIViewRepresentable {
       };
       window.__axNativeEvent = function (e) {
         try { window.dispatchEvent(new CustomEvent('axnative', { detail: e })); } catch (err) {}
+      };
+    })();
+    """
+
+    static let downloadBridgeJS = """
+    (function () {
+      if (!window.__AX_NATIVE) return;
+      window.axBgDownload = function (spec) {
+        try {
+          window.webkit.messageHandlers.axBg.postMessage({
+            op: 'start', key: String(spec.key), url: String(spec.url), title: String(spec.title || '')
+          });
+          return true;
+        } catch (e) { return false; }
+      };
+      window.axBgCancel = function (key) {
+        try { window.webkit.messageHandlers.axBg.postMessage({ op: 'cancel', key: String(key) }); } catch (e) {}
       };
     })();
     """
@@ -166,7 +191,9 @@ final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptM
         self.web = web
         web.configuration.userContentController.add(self, name: "shellRetry")
         web.configuration.userContentController.add(self, name: "axPlay")
+        web.configuration.userContentController.add(self, name: "axBg")
         NativePlayer.shared.attach(web)
+        AxDownloads.shared.attachWeb(web)
         configureRemoteCommandsIfNeeded()
         // Interruptions (calls, other apps' audio): on .began pause deterministically and
         // keep the card; on .ended re-claim the session + card but never auto-resume -
@@ -274,6 +301,23 @@ final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptM
         }
         if message.name == "axPlay", let d = message.body as? [String: Any] {
             NativePlayer.shared.message(d)
+        }
+        if message.name == "axBg", let d = message.body as? [String: Any] {
+            let op = d["op"] as? String ?? ""
+            if op == "start" {
+                // Same-origin only: the app is a download manager for THIS site, never a
+                // generic fetcher for whatever URL a page builds.
+                if let s = d["url"] as? String, let u = URL(string: s),
+                   !SHELL_HOST.isEmpty,
+                   (u.host ?? "").lowercased() == SHELL_HOST ||
+                   (u.host ?? "").lowercased().hasSuffix("." + SHELL_HOST) {
+                    AxDownloads.shared.start(key: d["key"] as? String ?? "",
+                                             url: u,
+                                             title: d["title"] as? String ?? "")
+                }
+            } else if op == "cancel" {
+                AxDownloads.shared.cancel(key: d["key"] as? String ?? "")
+            }
         }
     }
 
@@ -601,6 +645,11 @@ final class NativePlayer: NSObject {
         }
         return "mp3"
     }
+    /* INTERNAL BRIDGE for AxDownloads (2026-11-15): the background manager must write the
+       finished file to the EXACT path libquery/libplay read - same directory, same name, same
+       extension rule - or offline playback would silently miss native transfers. */
+    func bgLibURL(_ k: String) -> URL { libURL(k) }
+
     private func libName(_ k: String) -> String {
         "ax-l-" + (k.addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? k) + "." + mediaExt(k)
     }
@@ -947,5 +996,203 @@ final class NativePlayer: NSObject {
         let d = item.duration.seconds
         let t = av?.currentTime().seconds ?? 0
         if d.isFinite, d > 0, t >= d - 0.15 { av?.seek(to: .zero) }
+    }
+}
+
+
+// MARK: - Background download manager (URLSession background configuration, 2026-11-15)
+// The page hands a READY yt-dlp job's serve URL (our own origin only) plus the media key it
+// uses everywhere else. iOS transfers the file even while the app is suspended, keeps going
+// across network switches, and wakes the app for completion; the bytes land directly in the
+// engine library (Application Support/ax-library/ax-l-<key>) - the exact file the page's
+// axDlHasBytes / libquery / libplay already read, so offline playback needs no extra copy.
+final class AxDownloads: NSObject {
+    static let shared = AxDownloads()
+    private static let sessionID = "ax.bgdl.v1"
+
+    private var session: URLSession!
+    private weak var web: WKWebView?
+    private var bgCompletion: (() -> Void)?
+
+    /* key -> meta, persisted: a relaunch that happens ONLY to deliver session events still needs
+       the title/url to finish the bookkeeping correctly. */
+    private var meta: [String: [String: String]] = [:]
+
+    private override init() {
+        super.init()
+        meta = (UserDefaults.standard.object(forKey: "ax.bg.meta") as? [String: [String: String]]) ?? [:]
+        let cfg = URLSessionConfiguration.background(withIdentifier: Self.sessionID)
+        cfg.isDiscretionary = false                 // download now, not "when the system feels like it"
+        cfg.sessionSendsLaunchEvents = true
+        cfg.waitsForConnectivity = true             // flaky home Wi-Fi: wait instead of erroring
+        cfg.timeoutIntervalForRequest = 15 * 60
+        cfg.timeoutIntervalForResource = 6 * 60 * 60
+        session = URLSession(configuration: cfg, delegate: self, delegateQueue: nil)
+        // Foreground: hand the page a full task table so its download queue can reconcile
+        // whatever advanced (or finished) while it was frozen.
+        NotificationCenter.default.addObserver(forName: UIApplication.willEnterForegroundNotification,
+                                               object: nil, queue: .main) { [weak self] _ in
+            self?.syncToPage()
+        }
+    }
+
+    func attachWeb(_ w: WKWebView?) { web = w }
+
+    func handleBackgroundEvents(_ completionHandler: @escaping () -> Void) {
+        bgCompletion = completionHandler
+    }
+
+    func start(key: String, url: URL, title: String) {
+        guard !key.isEmpty, !alreadyRunning(key: key) else { return }
+        meta[key] = ["title": title,
+                     "url": url.absoluteString,
+                     "started": String(Date().timeIntervalSince1970)]
+        saveMeta()
+        let t = session.downloadTask(with: URLRequest(url: url))
+        t.taskDescription = key
+        t.resume()
+        emit(key: key, type: "start", got: 0, total: 0, msg: "")
+    }
+
+    func cancel(key: String) {
+        session.getAllTasks { [weak self] ts in
+            for t in ts where t.taskDescription == key { t.cancel() }
+            DispatchQueue.main.async {
+                self?.meta.removeValue(forKey: key)
+                self?.saveMeta()
+                UserDefaults.standard.removeObject(forKey: "ax.bg.resume." + key)
+            }
+        }
+    }
+
+    private func alreadyRunning(key: String) -> Bool {
+        // cheap guard against a double handoff: a tracked meta entry with a live task is running.
+        // getAllTasks is async; the meta check alone is enough because start() is the only writer.
+        return meta[key] != nil
+    }
+
+    private func saveMeta() {
+        UserDefaults.standard.set(meta, forKey: "ax.bg.meta")
+    }
+
+    private func clearMeta(_ key: String) {
+        meta.removeValue(forKey: key)
+        saveMeta()
+        UserDefaults.standard.removeObject(forKey: "ax.bg.resume." + key)
+    }
+
+    /* Full task table -> the page. Runs on foreground and after the session's pending events
+       are delivered. */
+    func syncToPage() {
+        session.getAllTasks { [weak self] ts in
+            guard let self = self else { return }
+            var rows: [[String: Any]] = []
+            for t in ts {
+                guard let k = t.taskDescription, !k.isEmpty else { continue }
+                rows.append(["type": "progress",
+                             "key": k,
+                             "got": Int(t.countOfBytesReceived),
+                             "total": max(0, Int(t.countOfBytesExpectedToReceive)),
+                             "state": t.state.rawValue])
+            }
+            DispatchQueue.main.async { self.emitRows(rows) }
+        }
+    }
+
+    /* Engine library location - MUST stay identical to NativePlayer.libURL(_:), which the
+       player's libquery/libplay already read. Kept in sync by construction (same directory,
+       same name shape). */
+    /* The player owns the naming (key rule + media extension). Never fork it here. */
+    private func libURL(_ k: String) -> URL {
+        NativePlayer.shared.bgLibURL(k)
+    }
+
+    private func emit(key: String, type: String, got: Int, total: Int, msg: String) {
+        let js = "window.dispatchEvent(new CustomEvent('axbg',{detail:{type:\(Self.json(type)),key:\(Self.json(key)),got:\(got),total:\(total),msg:\(Self.json(msg))}}))"
+        web?.evaluateJavaScript(js, completionHandler: nil)
+    }
+
+    private func emitRows(_ rows: [[String: Any]]) {
+        guard let data = try? JSONSerialization.data(withJSONObject: rows, options: []),
+              let s = String(data: data, encoding: .utf8) else { return }
+        // s is a JSON ARRAY of task rows; the page wraps it: detail {type:'sync', tasks:[...]}
+        emitRaw("{type:'sync',tasks:" + s + "}")
+    }
+
+    /* The one page-event emitter. `json` is a complete JS object literal. */
+    private func emitRaw(_ json: String) {
+        web?.evaluateJavaScript("window.dispatchEvent(new CustomEvent('axbg',{detail:\(json)}))",
+                                completionHandler: nil)
+    }
+
+    static func json(_ s: String) -> String {
+        let esc = s
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+        return "\"" + esc + "\""
+    }
+}
+
+extension AxDownloads: URLSessionDownloadDelegate, URLSessionDataDelegate {
+    /* Whole file arrived on disk: move it into the engine library under the page's key. */
+    func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask,
+                    didFinishDownloadingTo location: URL) {
+        let key = downloadTask.taskDescription ?? ""
+        guard !key.isEmpty else { return }
+        let fm = FileManager.default
+        let dest = libURL(key)
+        try? fm.removeItem(at: dest)
+        var size = 0
+        do { try fm.moveItem(at: location, to: dest) }
+        catch {
+            do { try fm.copyItem(at: location, to: dest); try? fm.removeItem(at: location) }
+            catch { DispatchQueue.main.async { self.clearMeta(key) }; return }
+        }
+        size = ((try? fm.attributesOfItem(atPath: dest.path))?[FileAttributeKey.size] as? Int) ?? 0
+        DispatchQueue.main.async {
+            self.clearMeta(key)
+            self.emit(key: key, type: "done", got: size, total: size, msg: "")
+            self.syncToPage()
+        }
+    }
+
+    /* Byte progress: only worth pushing while the page can run JS. */
+    func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask,
+                    didWriteData bytesWritten: Int64, totalBytesWritten: Int64,
+                    totalBytesExpectedToWrite: Int64) {
+        guard UIApplication.shared.applicationState == .active else { return }
+        let key = downloadTask.taskDescription ?? ""
+        guard !key.isEmpty else { return }
+        DispatchQueue.main.async {
+            self.emit(key: key, type: "progress",
+                      got: Int(totalBytesWritten),
+                      total: Int(max(0, totalBytesExpectedToWrite)), msg: "")
+        }
+    }
+
+    /* Error (nil error = success; the didFinish handler already stored the file). Keep Apple's
+       resume data so the page can restart byte-wise instead of from zero. */
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        guard let err = error else { return }
+        let key = task.taskDescription ?? ""
+        guard !key.isEmpty else { return }
+        let resume = (task as? URLSessionDownloadTask)?.resumeData
+        DispatchQueue.main.async {
+            /* Clear the meta so a page retry can hand the job again immediately; URLSession
+               itself already retried transient failures (waitsForConnectivity), so what reaches
+               here is a real error. Resume data is kept for future byte-wise restarts. */
+            if let resume = resume { UserDefaults.standard.set(resume, forKey: "ax.bg.resume." + key) }
+            self.clearMeta(key)
+            self.emit(key: key, type: "error", got: 0, total: 0,
+                      msg: err.localizedDescription)
+        }
+    }
+
+    /* All queued background events for this wake-up are delivered: tell iOS we are done. */
+    func urlSessionDidFinishEvents(forBackgroundURLSession session: URLSession) {
+        DispatchQueue.main.async { [weak self] in
+            self?.bgCompletion?()
+            self?.bgCompletion = nil
+        }
     }
 }
