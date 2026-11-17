@@ -119,10 +119,19 @@ struct ShellWebView: UIViewRepresentable {
     static let downloadBridgeJS = """
     (function () {
       if (!window.__AX_NATIVE) return;
+      window.__AX_BG_V2 = true;
       window.axBgDownload = function (spec) {
         try {
           window.webkit.messageHandlers.axBg.postMessage({
             op: 'start', key: String(spec.key), url: String(spec.url), title: String(spec.title || '')
+          });
+          return true;
+        } catch (e) { return false; }
+      };
+      window.axBgRegister = function (spec) {
+        try {
+          window.webkit.messageHandlers.axBg.postMessage({
+            op: 'register', key: String(spec.key), url: String(spec.url), title: String(spec.title || '')
           });
           return true;
         } catch (e) { return false; }
@@ -323,6 +332,15 @@ final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptM
                 }
             } else if op == "cancel" {
                 AxDownloads.shared.cancel(key: d["key"] as? String ?? "")
+            } else if op == "register" {
+                if let s = d["url"] as? String, let u = URL(string: s),
+                   !SHELL_HOST.isEmpty,
+                   (u.host ?? "").lowercased() == SHELL_HOST ||
+                   (u.host ?? "").lowercased().hasSuffix("." + SHELL_HOST) {
+                    AxDownloads.shared.register(key: d["key"] as? String ?? "",
+                                                url: u,
+                                                title: d["title"] as? String ?? "")
+                }
             }
         }
     }
@@ -1061,6 +1079,13 @@ final class AxDownloads: NSObject {
     /* key -> meta, persisted: a relaunch that happens ONLY to deliver session events still needs
        the title/url to finish the bookkeeping correctly. */
     private var meta: [String: [String: String]] = [:]
+    private var pending: [String: String] = [:]
+    /* SPOTIFY-STYLE BACKGROUND HANDOFF (his order: downloads must continue when he switches apps
+       or turns the screen off). The page REGISTERS its active transfer here while the app is in
+       the FOREGROUND; the moment the app goes to the background, this session starts the transfer
+       itself — iOS runs background downloads in a separate process while the app is suspended.
+       In-memory only: a registration that was never started dies with this launch, which is
+       exactly right — the page re-registers on its next transfer. */
 
     private override init() {
         super.init()
@@ -1078,6 +1103,36 @@ final class AxDownloads: NSObject {
                                                object: nil, queue: .main) { [weak self] _ in
             self?.syncToPage()
         }
+        // Background: TAKE OVER every registered transfer. This is the Spotify-style moment —
+        // the web page is about to freeze, so the native session must own the bytes now.
+        NotificationCenter.default.addObserver(forName: UIApplication.didEnterBackgroundNotification,
+                                               object: nil, queue: .main) { [weak self] _ in
+            self?.startAllRegistered()
+        }
+        /* BACKGROUND TAKEOVER (2026-11-17, his order: downloads must survive app-switch/screen-off).
+           The web layer cannot be trusted to react at hide-time — iOS freezes WKWebView JS around
+           the moment the app backgrounds, so the page's own visibilitychange handover is missed.
+           The APP therefore pulls the active transfer from the page at background-time: the page
+           exposes window.__axBgTakeover() -> {key,url,title} for its in-flight transfer (or null).
+           Apple: background URLSession download tasks "continue even when your app is in the
+           suspended state or otherwise not running" — exactly the Spotify-style behavior. */
+        NotificationCenter.default.addObserver(forName: UIApplication.didEnterBackgroundNotification,
+                                               object: nil, queue: .main) { [weak self] _ in
+            guard let self = self, self.web != nil else { return }
+            self.web?.evaluateJavaScript(
+                "(function(){try{return JSON.stringify(window.__axBgTakeover?window.__axBgTakeover():null)}catch(e){return \"null\"}})()",
+                completionHandler: { res, _ in
+                    guard let s = res as? String,
+                          let data = s.data(using: .utf8),
+                          let spec = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                          let key = spec["key"] as? String, !key.isEmpty,
+                          let u = spec["url"] as? String, let url = URL(string: u) else { return }
+                    let host = (url.host ?? "").lowercased()
+                    guard !SHELL_HOST.isEmpty, host == SHELL_HOST || host.hasSuffix("." + SHELL_HOST) else { return }
+                    let title = spec["title"] as? String ?? ""
+                    DispatchQueue.main.async { self.start(key: key, url: url, title: title) }
+                })
+        }
     }
 
     func attachWeb(_ w: WKWebView?) { web = w }
@@ -1086,33 +1141,72 @@ final class AxDownloads: NSObject {
         bgCompletion = completionHandler
     }
 
+    /* The page's queue promise must ALWAYS get an answer for a handoff. Three states:
+       1. bytes already in the library under this key (a previous transfer finished but its
+          'done' event was lost) -> answer done immediately; the page adopts the file;
+       2. a LIVE task for this key -> adopt it and push a sync so the page repaints its row;
+       3. otherwise -> (re)start. The old meta-only guard silently no-oped on a STALE entry
+          (meta written, task gone), which left the page's queue wedged on that row forever. */
     func start(key: String, url: URL, title: String) {
-        guard !key.isEmpty, !alreadyRunning(key: key) else { return }
-        meta[key] = ["title": title,
-                     "url": url.absoluteString,
-                     "started": String(Date().timeIntervalSince1970)]
-        saveMeta()
-        let t = session.downloadTask(with: URLRequest(url: url))
-        t.taskDescription = key
-        t.resume()
-        emit(key: key, type: "start", got: 0, total: 0, msg: "")
-    }
-
-    func cancel(key: String) {
+        guard !key.isEmpty else { return }
+        let dest = libURL(key)
+        if let attrs = try? FileManager.default.attributesOfItem(atPath: dest.path),
+           let sz = attrs[.size] as? Int, sz > 0 {
+            DispatchQueue.main.async { self.emit(key: key, type: "done", got: sz, total: sz, msg: "") }
+            return
+        }
         session.getAllTasks { [weak self] ts in
-            for t in ts where t.taskDescription == key { t.cancel() }
+            guard let self = self else { return }
+            let live = ts.contains { $0.taskDescription == key }
             DispatchQueue.main.async {
-                self?.meta.removeValue(forKey: key)
-                self?.saveMeta()
-                UserDefaults.standard.removeObject(forKey: "ax.bg.resume." + key)
+                self.meta[key] = ["title": title,
+                                  "url": url.absoluteString,
+                                  "started": String(Date().timeIntervalSince1970)]
+                self.saveMeta()
+                if live {
+                    self.syncToPage()
+                } else {
+                    /* bytes=0- marks the serve as PARTIAL on the server: the job dir survives the
+                       download, so a page retry or the windows fallback can resume the SAME job
+                       instead of hitting "file not ready" (a full serve deletes the dir). */
+                    var req = URLRequest(url: url)
+                    req.setValue("bytes=0-", forHTTPHeaderField: "Range")
+                    let t = self.session.downloadTask(with: req)
+                    t.taskDescription = key
+                    t.resume()
+                    self.emit(key: key, type: "start", got: 0, total: 0, msg: "")
+                }
             }
         }
     }
 
-    private func alreadyRunning(key: String) -> Bool {
-        // cheap guard against a double handoff: a tracked meta entry with a live task is running.
-        // getAllTasks is async; the meta check alone is enough because start() is the only writer.
-        return meta[key] != nil
+    func register(key: String, url: URL, title: String) {
+        guard !key.isEmpty else { return }
+        pending[key] = url.absoluteString
+    }
+
+    /* Start every registered transfer. Cancel also drops a pending registration so a cancelled
+       row never starts in the background. */
+    private func startAllRegistered() {
+        guard !pending.isEmpty else { return }
+        let jobs = pending
+        pending.removeAll()
+        for (key, urlString) in jobs {
+            guard let url = URL(string: urlString) else { continue }
+            start(key: key, url: url, title: meta[key]?["title"] ?? "")
+        }
+    }
+
+    func cancel(key: String) {
+        // Clear the bookkeeping FIRST: an instant re-download of the same key must never be
+        // swallowed while getAllTasks is still resolving (the old async clear raced it).
+        meta.removeValue(forKey: key)
+        pending.removeValue(forKey: key)
+        saveMeta()
+        UserDefaults.standard.removeObject(forKey: "ax.bg.resume." + key)
+        session.getAllTasks { ts in
+            for t in ts where t.taskDescription == key { t.cancel() }
+        }
     }
 
     private func saveMeta() {
