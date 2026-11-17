@@ -64,12 +64,8 @@ struct ShellWebView: UIViewRepresentable {
             WKUserScript(source: Self.downloadBridgeJS,
                          injectionTime: .atDocumentStart,
                          forMainFrameOnly: true))
-        // Notification bridge (2026-11-17): the page reports download progress/completion through
-        // ONE shared layer; the shell owns UNUserNotificationCenter. Content is title/percent only.
-        config.userContentController.addUserScript(
-            WKUserScript(source: Self.notifyBridgeJS,
-                         injectionTime: .atDocumentStart,
-                         forMainFrameOnly: true))
+        /* Notification bridge (2026-11-17): window.axNotify / window.axNotifyPermission ship
+           inside downloadBridgeJS above - ONE user script per concern, no stray statics. */
         // default (persistent) data store: cookies + IndexedDB + OPFS survive relaunches,
         // Service Workers run in-app on iOS 16.4+.
         let web = WKWebView(frame: .zero, configuration: config)
@@ -1463,7 +1459,6 @@ final class AxNotify: NSObject {
         if total > 0 { body += "\(Self.humanSize(got)) / \(Self.humanSize(total))" }
         if !phase.isEmpty && phase != "Downloading" && phase != "Paused" { body = phase + (body.isEmpty ? "" : " · " + body) }
         let c = content(title: title, body: body.isEmpty ? "Downloading…" : body)
-        c.progress = Double(pct) / 100.0
         let req = UNNotificationRequest(identifier: "ax.dl." + key, content: c, trigger: nil)
         center.add(req, withCompletionHandler: nil)
     }
@@ -1499,7 +1494,6 @@ final class AxNotify: NSObject {
         guard allowed, !name.isEmpty else { return }
         guard UIApplication.shared.applicationState != .active else { return }
         let c = content(title: name, body: "\(done) of \(total) files · \(pct)%")
-        c.progress = Double(pct) / 100.0
         center.add(UNNotificationRequest(identifier: "ax.pl." + name, content: c, trigger: nil), withCompletionHandler: nil)
     }
 
