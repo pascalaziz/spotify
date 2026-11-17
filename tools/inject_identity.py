@@ -60,7 +60,7 @@ p["CFBundleIdentifier"] = BUNDLE_ID
 # APP EXTENSIONS (2026-11-17): embedded PlugIns/*.app (the Live Activity widget) must keep a
 # bundle id that is a CHILD of the main id, or signing/install breaks. The generic build ships
 # com.webshell.<X>; rewrite to <BUNDLE_ID>.<same suffix> and rename its display name.
-for ext_app in sorted((app / "PlugIns").glob("*.app")) if (app / "PlugIns").is_dir() else []:
+for ext_app in sorted(list((app / "PlugIns").glob("*.appex")) + list((app / "PlugIns").glob("*.app"))) if (app / "PlugIns").is_dir() else []:
     ep = ext_app / "Info.plist"
     if not ep.exists(): continue
     pe = plistlib.loads(ep.read_bytes())
