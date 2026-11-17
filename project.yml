@@ -38,3 +38,29 @@ targets:
           - UIInterfaceOrientationPortrait
           - UIInterfaceOrientationLandscapeLeft
           - UIInterfaceOrientationLandscapeRight
+        NSSupportsLiveActivities: true
+
+  # LIVE ACTIVITY (2026-11-17): DownloadActivityAttributes is SHARED with the app
+  # (Shell/Sources/DownloadActivity.swift). Extension min iOS 16.1 (ActivityKit); the main app
+  # stays 15.0 and guards with #available, so devices below 16.1 keep working unchanged.
+  ShellWidgets:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: Shell/Widgets
+      - path: Shell/Sources/DownloadActivity.swift
+    settings:
+      base:
+        SWIFT_VERSION: "5.9"
+        TARGETED_DEVICE_FAMILY: "1,2"
+        IPHONEOS_DEPLOYMENT_TARGET: "16.1"
+        CODE_SIGN_STYLE: Manual
+        CODE_SIGN_IDENTITY: ""
+        CODE_SIGNING_REQUIRED: "NO"
+        CODE_SIGNING_ALLOWED: "NO"
+    info:
+      path: Shell/Widgets/Info.plist
+      properties:
+        CFBundleDisplayName: Download Widgets
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.widgetkit-extension

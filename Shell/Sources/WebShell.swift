@@ -3,6 +3,9 @@ import WebKit
 import AVFoundation
 import MediaPlayer
 import UserNotifications
+#if canImport(ActivityKit)
+import ActivityKit
+#endif
 
 // Generic WKWebView shell. Reads its target from shell.json inside the app
 // bundle ({"url":"https://..."}). The repo contains no product identity:
@@ -1103,6 +1106,13 @@ final class AxDownloads: NSObject {
        the title/url to finish the bookkeeping correctly. */
     private var meta: [String: [String: String]] = [:]
     private var pending: [String: String] = [:]
+    /* WAIT-READY RETRIES: backgrounding during the server rip phase hands a serve URL whose job
+       is not final yet; the serve answers 404 JSON. The engine used to save that JSON AS the
+       media. Now: content-validated, and retried NATIVELY with earliestBeginDate so iOS re-runs
+       the task in the background daemon (no app wake-up needed) until the file is ready. */
+    private var retries: [String: Int] = [:]
+    private static let maxWaitRetries = 80          // 80 x 15 s = 20 min (the rip ceiling)
+    private static let retryDelay: TimeInterval = 15
     /* SPOTIFY-STYLE BACKGROUND HANDOFF (his order: downloads must continue when he switches apps
        or turns the screen off). The page REGISTERS its active transfer here while the app is in
        the FOREGROUND; the moment the app goes to the background, this session starts the transfer
@@ -1153,7 +1163,8 @@ final class AxDownloads: NSObject {
                     let host = (url.host ?? "").lowercased()
                     guard !SHELL_HOST.isEmpty, host == SHELL_HOST || host.hasSuffix("." + SHELL_HOST) else { return }
                     let title = spec["title"] as? String ?? ""
-                    DispatchQueue.main.async { self.start(key: key, url: url, title: title) }
+                    let waitReady = (spec["wait"] as? Bool) == true || (spec["wait"] as? Int ?? 0) == 1
+                    DispatchQueue.main.async { self.start(key: key, url: url, title: title, waitReady: waitReady) }
                 })
         }
     }
@@ -1170,7 +1181,7 @@ final class AxDownloads: NSObject {
        2. a LIVE task for this key -> adopt it and push a sync so the page repaints its row;
        3. otherwise -> (re)start. The old meta-only guard silently no-oped on a STALE entry
           (meta written, task gone), which left the page's queue wedged on that row forever. */
-    func start(key: String, url: URL, title: String) {
+    func start(key: String, url: URL, title: String, waitReady: Bool = false) {
         guard !key.isEmpty else { return }
         let dest = libURL(key)
         if let attrs = try? FileManager.default.attributesOfItem(atPath: dest.path),
@@ -1185,6 +1196,7 @@ final class AxDownloads: NSObject {
                 self.meta[key] = ["title": title,
                                   "url": url.absoluteString,
                                   "started": String(Date().timeIntervalSince1970)]
+                if waitReady { self.meta[key]?["wait"] = "1" }
                 self.saveMeta()
                 if live {
                     self.syncToPage()
@@ -1196,6 +1208,9 @@ final class AxDownloads: NSObject {
                     req.setValue("bytes=0-", forHTTPHeaderField: "Range")
                     let t = self.session.downloadTask(with: req)
                     t.taskDescription = key
+                    /* WAIT-READY: iOS re-runs this task natively at the earliest date WITHOUT
+                       waking the app - exactly what a backgrounded rip phase needs. */
+                    if waitReady { t.earliestBeginDate = Date(timeIntervalSinceNow: Self.retryDelay) }
                     t.resume()
                     self.emit(key: key, type: "start", got: 0, total: 0, msg: "")
                 }
@@ -1203,9 +1218,10 @@ final class AxDownloads: NSObject {
         }
     }
 
-    func register(key: String, url: URL, title: String) {
+    func register(key: String, url: URL, title: String, waitReady: Bool = false) {
         guard !key.isEmpty else { return }
         pending[key] = url.absoluteString
+        if waitReady { meta[key] = (meta[key] ?? ["title": title]); meta[key]?["wait"] = "1"; saveMeta() }
     }
 
     /* Start every registered transfer. Cancel also drops a pending registration so a cancelled
@@ -1216,12 +1232,14 @@ final class AxDownloads: NSObject {
         pending.removeAll()
         for (key, urlString) in jobs {
             guard let url = URL(string: urlString) else { continue }
-            start(key: key, url: url, title: meta[key]?["title"] ?? "")
+            let waitReady = meta[key]?["wait"] == "1"
+            start(key: key, url: url, title: meta[key]?["title"] ?? "", waitReady: waitReady)
         }
     }
 
     func cancel(key: String) {
         AxNotify.shared.clearProgress(key: key)   // a cancelled job's progress notification goes too
+        AxActivity.shared.end(status: "Cancelled")
         // Clear the bookkeeping FIRST: an instant re-download of the same key must never be
         // swallowed while getAllTasks is still resolving (the old async clear raced it).
         meta.removeValue(forKey: key)
@@ -1259,6 +1277,17 @@ final class AxDownloads: NSObject {
             }
             DispatchQueue.main.async { self.emitRows(rows) }
         }
+    }
+
+    /* An error body (JSON/HTML) is never media: MP3/MP4 never start with { or <. */
+    static func looksLikeErrorBody(_ f: URL) -> Bool {
+        guard let fh = try? FileHandle(forReadingFrom: f) else { return true }
+        defer { try? fh.close() }
+        guard let d = try? fh.read(upToCount: 512), !d.isEmpty else { return true }
+        var i = 0
+        while i < d.count && (d[i] == 32 || d[i] == 9 || d[i] == 10 || d[i] == 13) { i += 1 }
+        guard i < d.count else { return true }
+        return d[i] == UInt8(ascii: "{") || d[i] == UInt8(ascii: "<")
     }
 
     /* Engine library location - MUST stay identical to NativePlayer.libURL(_:), which the
@@ -1310,11 +1339,47 @@ extension AxDownloads: URLSessionDownloadDelegate, URLSessionDataDelegate {
             do { try fm.copyItem(at: location, to: dest); try? fm.removeItem(at: location) }
             catch { DispatchQueue.main.async { self.clearMeta(key) }; return }
         }
+        /* CONTENT VALIDATION (same guard the web engine has had since the 404 era): the serve
+           endpoint answers 404 JSON until the server-side rip is final. Never let an error body
+           land in the media library as a "completed download". */
+        if Self.looksLikeErrorBody(dest) {
+            try? fm.removeItem(at: dest)
+            let waited = meta[key]?["wait"] == "1"
+            let n = (retries[key] ?? 0) + 1
+            if waited && n <= Self.maxWaitRetries {
+                retries[key] = n
+                if let s = meta[key]?["url"], let u = URL(string: s) {
+                    DispatchQueue.main.async {
+                        var req = URLRequest(url: u)
+                        req.setValue("bytes=0-", forHTTPHeaderField: "Range")
+                        let t = self.session.downloadTask(with: req)
+                        t.taskDescription = key
+                        t.earliestBeginDate = Date(timeIntervalSinceNow: Self.retryDelay)
+                        t.resume()
+                        AxNotify.shared.progress(key: key, title: self.meta[key]?["title"] ?? key,
+                                                 pct: 0, got: 0, total: 0, phase: "Preparing")
+                        AxActivity.shared.update(title: self.meta[key]?["title"] ?? key, pct: 0, got: 0, total: 0, status: "Preparing")
+                        self.emit(key: key, type: "progress", got: 0, total: 0, msg: "waiting for the server job")
+                    }
+                }
+                return
+            }
+            retries[key] = nil
+            DispatchQueue.main.async {
+                let t = self.meta[key]?["title"] ?? key
+                self.clearMeta(key)
+                AxNotify.shared.failed(key: key, title: t, error: "the server job never became ready")
+                self.emit(key: key, type: "error", got: 0, total: 0, msg: "server job never became ready")
+            }
+            return
+        }
+        retries[key] = nil
         size = ((try? fm.attributesOfItem(atPath: dest.path))?[FileAttributeKey.size] as? Int) ?? 0
         DispatchQueue.main.async {
             let t = self.meta[key]?["title"] ?? ""
             self.clearMeta(key)
             AxNotify.shared.completed(key: key, title: t.isEmpty ? key : t)
+            AxActivity.shared.end(status: "Complete")
             self.emit(key: key, type: "done", got: size, total: size, msg: "")
             self.syncToPage()
         }
@@ -1327,9 +1392,13 @@ extension AxDownloads: URLSessionDownloadDelegate, URLSessionDataDelegate {
         let key = downloadTask.taskDescription ?? ""
         guard !key.isEmpty else { return }
         DispatchQueue.main.async {
+            let t = self.meta[key]?["title"] ?? key
+            let pct = totalBytesExpectedToWrite > 0 ? Double(Double(totalBytesWritten) / Double(totalBytesExpectedToWrite) * 100) : 0
+            AxActivity.shared.ensure(title: t)
+            AxActivity.shared.update(title: t, pct: pct, got: Int(totalBytesWritten), total: Int(max(0, totalBytesExpectedToWrite)), status: "Downloading")
             AxNotify.shared.progress(key: key,
-                                     title: self.meta[key]?["title"] ?? key,
-                                     pct: totalBytesExpectedToWrite > 0 ? Int(Double(totalBytesWritten) / Double(totalBytesExpectedToWrite) * 100) : 0,
+                                     title: t,
+                                     pct: Int(pct),
                                      got: Int(totalBytesWritten),
                                      total: Int(max(0, totalBytesExpectedToWrite)),
                                      phase: "Downloading")
@@ -1349,6 +1418,7 @@ extension AxDownloads: URLSessionDownloadDelegate, URLSessionDataDelegate {
         guard !key.isEmpty else { return }
         DispatchQueue.main.async {
             let t = self.meta[key]?["title"] ?? ""
+            AxActivity.shared.end(status: "Failed")
             /* Clear the meta so a page retry can hand the job again immediately. URLSession
                itself already retried transient failures (waitsForConnectivity), so what reaches
                here is a real error; the retry re-serves the SAME server job (the dir survives
@@ -1369,6 +1439,63 @@ extension AxDownloads: URLSessionDownloadDelegate, URLSessionDataDelegate {
     }
 }
 
+
+/* ---------- LIVE ACTIVITY (2026-11-17) ----------
+   ActivityKit Live Activity for the CURRENT download: Lock Screen + Dynamic Island.
+   Updated ONLY from real native URLSession callbacks (didWriteData etc.) - every time iOS wakes
+   the process it pushes the newest real byte counts; between wakeups the last accurate state
+   stays visible (iOS coalesces background updates; nothing is estimated). One activity at a time
+   (the download queue is serial). Ended on complete / fail / cancel with a final state. */
+final class AxActivity {
+    static let shared = AxActivity()
+    #if canImport(ActivityKit)
+    private var activity: Activity<DownloadActivityAttributes>?
+    private var lastPush: Date = .distantPast
+    private var lastTitle = ""
+    private var lastPct: Double = 0
+    private var lastGot = 0
+    private var lastTotal = 0
+    private var brand = (Bundle.main.infoDictionary?["CFBundleDisplayName"] as? String) ?? "imfan"
+    #endif
+
+    /* Start on the first REAL native progress callback. No-op when activities are disabled
+       (iOS 16.0 devices, Low Power Mode restrictions, user setting). */
+    func ensure(title: String) {
+        #if canImport(ActivityKit)
+        guard #available(iOS 16.1, *) else { return }
+        guard activity == nil else { return }
+        guard ActivityAuthorizationInfo().areActivitiesEnabled else { return }
+        lastTitle = title
+        let attr = DownloadActivityAttributes(brand: brand)
+        let st = DownloadActivityAttributes.ContentState(title: title, pct: 0, got: 0, total: 0, status: "Downloading")
+        activity = try? Activity<DownloadActivityAttributes>.request(attributes: attr, contentState: st)
+        #endif
+    }
+
+    func update(title: String, pct: Double, got: Int, total: Int, status: String) {
+        #if canImport(ActivityKit)
+        guard #available(iOS 16.1, *) else { return }
+        lastTitle = title; lastPct = pct; lastGot = got; lastTotal = total
+        guard let a = activity else { return }
+        let now = Date()
+        guard now.timeIntervalSince(lastPush) >= 1.0 else { return }   // ActivityKit update budget
+        lastPush = now
+        let st = DownloadActivityAttributes.ContentState(title: title, pct: pct, got: got, total: total, status: status)
+        Task { await a.update(.init(state: st)) }
+        #endif
+    }
+
+    func end(status: String) {
+        #if canImport(ActivityKit)
+        guard #available(iOS 16.1, *) else { return }
+        guard let a = activity else { return }
+        activity = nil
+        let pct = status == "Complete" ? 100.0 : lastPct
+        let st = DownloadActivityAttributes.ContentState(title: lastTitle, pct: pct, got: lastGot, total: lastTotal, status: status)
+        Task { await a.end(.init(state: st), dismissalPolicy: .immediate) }
+        #endif
+    }
+}
 
 /* ---------- Download notifications (2026-11-17) ----------
    UNUserNotificationCenter, no entitlements, iOS 15+. ONE notification per download (updated in
@@ -1411,8 +1538,15 @@ final class AxNotify: NSObject {
             let doneFiles = d["doneFiles"] as? Int ?? Int((d["doneFiles"] as? Double) ?? 0)
             let totalFiles = d["totalFiles"] as? Int ?? Int((d["totalFiles"] as? Double) ?? 0)
             let pct = d["pct"] as? Int ?? Int((d["pct"] as? Double) ?? 0)
-            if pkind == "done" { playlistDone(name: name, done: doneFiles, total: totalFiles) }
-            else { playlistProgress(name: name, done: doneFiles, total: totalFiles, pct: pct) }
+            if pkind == "done" {
+                playlistDone(name: name, done: doneFiles, total: totalFiles)
+                AxActivity.shared.end(status: "Complete")
+            } else {
+                /* Playlist progress feeds the LIVE ACTIVITY (one surface, no notification spam). */
+                AxActivity.shared.ensure(title: name)
+                AxActivity.shared.update(title: name, pct: Double(pct), got: 0, total: 0,
+                                         status: "\(doneFiles) of \(totalFiles) files")
+            }
         default: break
         }
     }

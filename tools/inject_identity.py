@@ -57,6 +57,18 @@ p = plistlib.loads(plist_path.read_bytes())
 p["CFBundleDisplayName"] = APP_NAME
 p["CFBundleName"] = APP_NAME
 p["CFBundleIdentifier"] = BUNDLE_ID
+# APP EXTENSIONS (2026-11-17): embedded PlugIns/*.app (the Live Activity widget) must keep a
+# bundle id that is a CHILD of the main id, or signing/install breaks. The generic build ships
+# com.webshell.<X>; rewrite to <BUNDLE_ID>.<same suffix> and rename its display name.
+for ext_app in sorted((app / "PlugIns").glob("*.app")) if (app / "PlugIns").is_dir() else []:
+    ep = ext_app / "Info.plist"
+    if not ep.exists(): continue
+    pe = plistlib.loads(ep.read_bytes())
+    old = str(pe.get("CFBundleIdentifier") or "")
+    suffix = old.split(".")[-1] if "." in old else "Widgets"
+    pe["CFBundleIdentifier"] = BUNDLE_ID + "." + suffix
+    pe["CFBundleDisplayName"] = APP_NAME
+    ep.write_bytes(plistlib.dumps(pe))
 # BUILD VERSION MUST BE UNIQUE PER BUILD (2026-11-06). The third-party signer (AppleJr) memoises
 # signed output per bundle identifier + CFBundleVersion: every upload of a NEW binary carrying the
 # same "1" got back the OLD signed .ipa (proved: uploaded a 185,992-byte binary, downloaded a
