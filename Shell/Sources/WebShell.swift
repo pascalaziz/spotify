@@ -2,6 +2,7 @@ import SwiftUI
 import WebKit
 import AVFoundation
 import MediaPlayer
+import UserNotifications
 
 // Generic WKWebView shell. Reads its target from shell.json inside the app
 // bundle ({"url":"https://..."}). The repo contains no product identity:
@@ -61,6 +62,12 @@ struct ShellWebView: UIViewRepresentable {
         // and a full sync rides UIApplicationWillEnterForeground so the queue can reconcile.
         config.userContentController.addUserScript(
             WKUserScript(source: Self.downloadBridgeJS,
+                         injectionTime: .atDocumentStart,
+                         forMainFrameOnly: true))
+        // Notification bridge (2026-11-17): the page reports download progress/completion through
+        // ONE shared layer; the shell owns UNUserNotificationCenter. Content is title/percent only.
+        config.userContentController.addUserScript(
+            WKUserScript(source: Self.notifyBridgeJS,
                          injectionTime: .atDocumentStart,
                          forMainFrameOnly: true))
         // default (persistent) data store: cookies + IndexedDB + OPFS survive relaunches,
@@ -139,6 +146,22 @@ struct ShellWebView: UIViewRepresentable {
       window.axBgCancel = function (key) {
         try { window.webkit.messageHandlers.axBg.postMessage({ op: 'cancel', key: String(key) }); } catch (e) {}
       };
+      /* Download notification layer (safe fields only: title/percent/byte counts). */
+      window.axNotify = function (d) {
+        try {
+          window.webkit.messageHandlers.axNotify.postMessage({
+            kind: String(d.kind || 'progress'), key: String(d.key || ''),
+            title: String(d.title || ''), phase: String(d.phase || ''),
+            pct: Number(d.pct || 0), got: Number(d.got || 0), total: Number(d.total || 0),
+            pkind: String(d.pkind || 'progress'), plId: String(d.plId || ''),
+            plName: String(d.plName || ''), doneFiles: Number(d.doneFiles || 0),
+            totalFiles: Number(d.totalFiles || 0)
+          });
+        } catch (e) {}
+      };
+      window.axNotifyPermission = function () {
+        try { window.webkit.messageHandlers.axNotify.postMessage({ kind: 'perm' }); } catch (e) {}
+      };
     })();
     """
 
@@ -201,6 +224,7 @@ final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptM
         web.configuration.userContentController.add(self, name: "shellRetry")
         web.configuration.userContentController.add(self, name: "axPlay")
         web.configuration.userContentController.add(self, name: "axBg")
+        web.configuration.userContentController.add(self, name: "axNotify")
         NativePlayer.shared.attach(web)
         AxDownloads.shared.attachWeb(web)
         NativePlayer.shared.refreshBrandArt(shellHost: SHELL_HOST)
@@ -342,6 +366,9 @@ final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptM
                                                 title: d["title"] as? String ?? "")
                 }
             }
+        }
+        if message.name == "axNotify", let d = message.body as? [String: Any] {
+            AxNotify.shared.message(d)
         }
     }
 
@@ -1198,6 +1225,7 @@ final class AxDownloads: NSObject {
     }
 
     func cancel(key: String) {
+        AxNotify.shared.clearProgress(key: key)   // a cancelled job's progress notification goes too
         // Clear the bookkeeping FIRST: an instant re-download of the same key must never be
         // swallowed while getAllTasks is still resolving (the old async clear raced it).
         meta.removeValue(forKey: key)
@@ -1288,7 +1316,9 @@ extension AxDownloads: URLSessionDownloadDelegate, URLSessionDataDelegate {
         }
         size = ((try? fm.attributesOfItem(atPath: dest.path))?[FileAttributeKey.size] as? Int) ?? 0
         DispatchQueue.main.async {
+            let t = self.meta[key]?["title"] ?? ""
             self.clearMeta(key)
+            AxNotify.shared.completed(key: key, title: t.isEmpty ? key : t)
             self.emit(key: key, type: "done", got: size, total: size, msg: "")
             self.syncToPage()
         }
@@ -1298,13 +1328,20 @@ extension AxDownloads: URLSessionDownloadDelegate, URLSessionDataDelegate {
     func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask,
                     didWriteData bytesWritten: Int64, totalBytesWritten: Int64,
                     totalBytesExpectedToWrite: Int64) {
-        guard UIApplication.shared.applicationState == .active else { return }
         let key = downloadTask.taskDescription ?? ""
         guard !key.isEmpty else { return }
         DispatchQueue.main.async {
-            self.emit(key: key, type: "progress",
-                      got: Int(totalBytesWritten),
-                      total: Int(max(0, totalBytesExpectedToWrite)), msg: "")
+            AxNotify.shared.progress(key: key,
+                                     title: self.meta[key]?["title"] ?? key,
+                                     pct: totalBytesExpectedToWrite > 0 ? Int(Double(totalBytesWritten) / Double(totalBytesExpectedToWrite) * 100) : 0,
+                                     got: Int(totalBytesWritten),
+                                     total: Int(max(0, totalBytesExpectedToWrite)),
+                                     phase: "Downloading")
+            if UIApplication.shared.applicationState == .active {
+                self.emit(key: key, type: "progress",
+                          got: Int(totalBytesWritten),
+                          total: Int(max(0, totalBytesExpectedToWrite)), msg: "")
+            }
         }
     }
 
@@ -1315,11 +1352,13 @@ extension AxDownloads: URLSessionDownloadDelegate, URLSessionDataDelegate {
         let key = task.taskDescription ?? ""
         guard !key.isEmpty else { return }
         DispatchQueue.main.async {
+            let t = self.meta[key]?["title"] ?? ""
             /* Clear the meta so a page retry can hand the job again immediately. URLSession
                itself already retried transient failures (waitsForConnectivity), so what reaches
                here is a real error; the retry re-serves the SAME server job (the dir survives
                partial serves), so nothing is lost. */
             self.clearMeta(key)
+            AxNotify.shared.failed(key: key, title: t.isEmpty ? key : t, error: err.localizedDescription)
             self.emit(key: key, type: "error", got: 0, total: 0,
                       msg: err.localizedDescription)
         }
@@ -1331,5 +1370,144 @@ extension AxDownloads: URLSessionDownloadDelegate, URLSessionDataDelegate {
             self?.bgCompletion?()
             self?.bgCompletion = nil
         }
+    }
+}
+
+
+/* ---------- Download notifications (2026-11-17) ----------
+   UNUserNotificationCenter, no entitlements, iOS 15+. ONE notification per download (updated in
+   place - a 50-file playlist NEVER posts 50 notifications), grouped playlist progress, and
+   completion/failure notices. Progress updates post only while the app is BACKGROUNDED: in the
+   foreground the in-app download panel is the surface, and Apple's HIG warns against foreground
+   notification spam. Content carries title/percent/byte counts only - never URLs, tokens or keys.
+   Permission is requested ONCE per install, from the page's first download (a user gesture), and
+   a denial is never re-prompted. */
+final class AxNotify: NSObject {
+    static let shared = AxNotify()
+    private var lastProgress: [String: Date] = [:]
+    private var titles: [String: String] = [:]
+    private let center = UNUserNotificationCenter.current()
+
+    func message(_ d: [String: Any]) {
+        let kind = d["kind"] as? String ?? "progress"
+        if kind == "perm" { requestOnce(); return }
+        let key = d["key"] as? String ?? ""
+        guard !key.isEmpty else { return }
+        let title = d["title"] as? String ?? ""
+        if !title.isEmpty { titles[key] = title }
+        let shownTitle = titles[key] ?? title
+        switch kind {
+        case "progress":
+            progress(key: key, title: shownTitle,
+                     pct: d["pct"] as? Int ?? Int((d["pct"] as? Double) ?? 0),
+                     got: d["got"] as? Int ?? Int((d["got"] as? Double) ?? 0),
+                     total: d["total"] as? Int ?? Int((d["total"] as? Double) ?? 0),
+                     phase: d["phase"] as? String ?? "")
+        case "done":
+            completed(key: key, title: shownTitle)
+        case "failed":
+            failed(key: key, title: shownTitle, error: d["error"] as? String ?? "")
+        case "cleared":
+            clearProgress(key: key)
+        case "playlist":
+            let name = d["plName"] as? String ?? key
+            let pkind = d["pkind"] as? String ?? "progress"
+            let doneFiles = d["doneFiles"] as? Int ?? Int((d["doneFiles"] as? Double) ?? 0)
+            let totalFiles = d["totalFiles"] as? Int ?? Int((d["totalFiles"] as? Double) ?? 0)
+            let pct = d["pct"] as? Int ?? Int((d["pct"] as? Double) ?? 0)
+            if pkind == "done" { playlistDone(name: name, done: doneFiles, total: totalFiles) }
+            else { playlistProgress(name: name, done: doneFiles, total: totalFiles, pct: pct) }
+        default: break
+        }
+    }
+
+    func requestOnce() {
+        let ud = UserDefaults.standard
+        if ud.bool(forKey: "ax.notify.asked") { return }
+        ud.set(true, forKey: "ax.notify.asked")
+        center.requestAuthorization(options: [.alert, .sound]) { granted, _ in
+            UserDefaults.standard.set(granted, forKey: "ax.notify.granted")
+        }
+    }
+
+    private var allowed: Bool {
+        // .authorized or .provisional -> post; .notDetermined -> first download also asks.
+        if !UserDefaults.standard.bool(forKey: "ax.notify.asked") { requestOnce(); return false }
+        return UserDefaults.standard.object(forKey: "ax.notify.granted") as? Bool ?? false
+    }
+
+    private static func humanSize(_ b: Int) -> String {
+        if b >= 1_073_741_824 { return String(format: "%.2f GB", Double(b) / 1_073_741_824) }
+        if b >= 1_048_576 { return String(format: "%.1f MB", Double(b) / 1_048_576) }
+        if b >= 1024 { return String(format: "%.0f KB", Double(b) / 1024) }
+        return "\(b) B"
+    }
+
+    private func content(title: String, body: String) -> UNMutableNotificationContent {
+        let c = UNMutableNotificationContent()
+        c.title = title
+        c.body = body
+        c.sound = nil   // progress stays silent; completion sets its own sound
+        return c
+    }
+
+    /* One notification per download key, updated in place. Throttled to >= 1.2 s per key.
+       Posted only while backgrounded - in the foreground the in-app panel is the surface. */
+    func progress(key: String, title: String, pct: Int, got: Int, total: Int, phase: String) {
+        guard allowed, !key.isEmpty, !title.isEmpty else { return }
+        guard UIApplication.shared.applicationState != .active else { return }
+        let now = Date()
+        if let last = lastProgress[key], now.timeIntervalSince(last) < 1.2 { return }
+        lastProgress[key] = now
+        var body = pct > 0 ? "\(pct)% · " : ""
+        if total > 0 { body += "\(Self.humanSize(got)) / \(Self.humanSize(total))" }
+        if !phase.isEmpty && phase != "Downloading" && phase != "Paused" { body = phase + (body.isEmpty ? "" : " · " + body) }
+        let c = content(title: title, body: body.isEmpty ? "Downloading…" : body)
+        c.progress = Double(pct) / 100.0
+        let req = UNNotificationRequest(identifier: "ax.dl." + key, content: c, trigger: nil)
+        center.add(req, withCompletionHandler: nil)
+    }
+
+    func completed(key: String, title: String) {
+        clearProgress(key: key)
+        lastProgress.removeValue(forKey: key)
+        guard allowed, !title.isEmpty else { return }
+        let c = content(title: title, body: "Download complete")
+        c.sound = .default
+        let req = UNNotificationRequest(identifier: "ax.dlfinal." + key, content: c, trigger: nil)
+        center.add(req, withCompletionHandler: nil)
+    }
+
+    func failed(key: String, title: String, error: String) {
+        clearProgress(key: key)
+        lastProgress.removeValue(forKey: key)
+        guard allowed, !title.isEmpty else { return }
+        let body = error.isEmpty ? "Download failed — reopen the app to retry." : "Download failed — reopen the app to retry. (\(error))"
+        let c = content(title: title, body: body)
+        c.sound = .default
+        let req = UNNotificationRequest(identifier: "ax.dlfinal." + key, content: c, trigger: nil)
+        center.add(req, withCompletionHandler: nil)
+    }
+
+    func clearProgress(key: String) {
+        center.removeDeliveredNotifications(withIdentifiers: ["ax.dl." + key])
+        center.removePendingNotificationRequests(withIdentifiers: ["ax.dl." + key])
+    }
+
+    /* PLAYLIST: one aggregated notification, updated in place; one completion notice at the end. */
+    func playlistProgress(name: String, done: Int, total: Int, pct: Int) {
+        guard allowed, !name.isEmpty else { return }
+        guard UIApplication.shared.applicationState != .active else { return }
+        let c = content(title: name, body: "\(done) of \(total) files · \(pct)%")
+        c.progress = Double(pct) / 100.0
+        center.add(UNNotificationRequest(identifier: "ax.pl." + name, content: c, trigger: nil), withCompletionHandler: nil)
+    }
+
+    func playlistDone(name: String, done: Int, total: Int) {
+        guard allowed, !name.isEmpty else { return }
+        center.removeDeliveredNotifications(withIdentifiers: ["ax.pl." + name])
+        let c = content(title: name, body: "Playlist ready · \(done) of \(total) files downloaded")
+        c.sound = .default
+        center.add(UNNotificationRequest(identifier: "ax.plfinal." + name, content: c, trigger: nil), withCompletionHandler: nil)
     }
 }
