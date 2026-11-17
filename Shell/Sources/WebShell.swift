@@ -1484,7 +1484,7 @@ final class AxActivity {
         let st = DownloadActivityAttributes.ContentState(title: title, pct: pct, got: got, total: total, status: status)
         /* The combined end(content:dismissalPolicy:) overload is 16.2; the 16.1-safe form is
            update(Content) with a fully-populated Content init. */
-        Task { await a.update(Activity<DownloadActivityAttributes>.Content(state: st, staleDate: nil, relevanceScore: 0)) }
+        Task { await a.update(.init(state: st, staleDate: nil, relevanceScore: 0)) }
         #endif
     }
 
@@ -1497,10 +1497,7 @@ final class AxActivity {
         let st = DownloadActivityAttributes.ContentState(title: lastTitle, pct: pct, got: lastGot, total: lastTotal, status: status)
         /* 16.1-safe ending: end(Content) followed by end(dismissalPolicy:) - the combined
            end(content:dismissalPolicy:) overload is 16.2+. */
-        Task {
-            await a.end(Activity<DownloadActivityAttributes>.Content(state: st, staleDate: nil, relevanceScore: 0))
-            await a.end(dismissalPolicy: .immediate)
-        }
+        Task { await a.end(.init(state: st, staleDate: nil, relevanceScore: 0), dismissalPolicy: .immediate) }
         #endif
     }
 }
