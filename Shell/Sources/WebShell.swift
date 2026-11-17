@@ -1463,7 +1463,7 @@ final class AxActivity {
        (iOS 16.0 devices, Low Power Mode restrictions, user setting). */
     func ensure(title: String) {
         #if canImport(ActivityKit)
-        guard #available(iOS 16.1, *) else { return }
+        guard #available(iOS 16.2, *) else { return }
         guard activityBox == nil else { return }
         guard ActivityAuthorizationInfo().areActivitiesEnabled else { return }
         lastTitle = title
@@ -1475,7 +1475,7 @@ final class AxActivity {
 
     func update(title: String, pct: Double, got: Int, total: Int, status: String) {
         #if canImport(ActivityKit)
-        guard #available(iOS 16.1, *) else { return }
+        guard #available(iOS 16.2, *) else { return }
         lastTitle = title; lastPct = pct; lastGot = got; lastTotal = total
         guard let a = activityBox as? Activity<DownloadActivityAttributes> else { return }
         let now = Date()
@@ -1490,7 +1490,7 @@ final class AxActivity {
 
     func end(status: String) {
         #if canImport(ActivityKit)
-        guard #available(iOS 16.1, *) else { return }
+        guard #available(iOS 16.2, *) else { return }
         guard let a = activityBox as? Activity<DownloadActivityAttributes> else { return }
         activityBox = nil
         let pct = status == "Complete" ? 100.0 : lastPct
