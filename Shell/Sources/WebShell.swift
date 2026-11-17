@@ -1464,7 +1464,7 @@ final class AxActivity {
     func ensure(title: String) {
         #if canImport(ActivityKit)
         guard #available(iOS 16.1, *) else { return }
-        guard activity == nil else { return }
+        guard activityBox == nil else { return }
         guard ActivityAuthorizationInfo().areActivitiesEnabled else { return }
         lastTitle = title
         let attr = DownloadActivityAttributes(brand: brand)
@@ -1482,7 +1482,9 @@ final class AxActivity {
         guard now.timeIntervalSince(lastPush) >= 1.0 else { return }   // ActivityKit update budget
         lastPush = now
         let st = DownloadActivityAttributes.ContentState(title: title, pct: pct, got: got, total: total, status: status)
-        Task { await a.update(.init(state: st, staleDate: nil)) }
+        /* The combined end(content:dismissalPolicy:) overload is 16.2; the 16.1-safe form is
+           update(Content) with a fully-populated Content init. */
+        Task { await a.update(Activity<DownloadActivityAttributes>.Content(state: st, staleDate: nil, relevanceScore: 0)) }
         #endif
     }
 
@@ -1493,7 +1495,12 @@ final class AxActivity {
         activityBox = nil
         let pct = status == "Complete" ? 100.0 : lastPct
         let st = DownloadActivityAttributes.ContentState(title: lastTitle, pct: pct, got: lastGot, total: lastTotal, status: status)
-        Task { await a.end(.init(state: st, staleDate: nil), dismissalPolicy: .immediate) }
+        /* 16.1-safe ending: end(Content) followed by end(dismissalPolicy:) - the combined
+           end(content:dismissalPolicy:) overload is 16.2+. */
+        Task {
+            await a.end(Activity<DownloadActivityAttributes>.Content(state: st, staleDate: nil, relevanceScore: 0))
+            await a.end(dismissalPolicy: .immediate)
+        }
         #endif
     }
 }
