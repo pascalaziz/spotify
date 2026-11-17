@@ -22,6 +22,8 @@ targets:
   Shell:
     type: application
     platform: iOS
+    dependencies:
+      - target: ShellWidgets      # build + embed the Live Activity extension (PlugIns/)
     sources:
       - path: Shell/Sources
     info:
