@@ -1449,7 +1449,8 @@ extension AxDownloads: URLSessionDownloadDelegate, URLSessionDataDelegate {
 final class AxActivity {
     static let shared = AxActivity()
     #if canImport(ActivityKit)
-    private var activity: Activity<DownloadActivityAttributes>?
+    /* Boxed: the class is available from iOS 15, Activity<> is 16.1+ - cast inside guards. */
+    private var activityBox: Any?
     private var lastPush: Date = .distantPast
     private var lastTitle = ""
     private var lastPct: Double = 0
@@ -1468,7 +1469,7 @@ final class AxActivity {
         lastTitle = title
         let attr = DownloadActivityAttributes(brand: brand)
         let st = DownloadActivityAttributes.ContentState(title: title, pct: 0, got: 0, total: 0, status: "Downloading")
-        activity = try? Activity<DownloadActivityAttributes>.request(attributes: attr, contentState: st)
+        activityBox = try? Activity<DownloadActivityAttributes>.request(attributes: attr, contentState: st)
         #endif
     }
 
@@ -1476,23 +1477,23 @@ final class AxActivity {
         #if canImport(ActivityKit)
         guard #available(iOS 16.1, *) else { return }
         lastTitle = title; lastPct = pct; lastGot = got; lastTotal = total
-        guard let a = activity else { return }
+        guard let a = activityBox as? Activity<DownloadActivityAttributes> else { return }
         let now = Date()
         guard now.timeIntervalSince(lastPush) >= 1.0 else { return }   // ActivityKit update budget
         lastPush = now
         let st = DownloadActivityAttributes.ContentState(title: title, pct: pct, got: got, total: total, status: status)
-        Task { await a.update(.init(state: st)) }
+        Task { await a.update(.init(state: st, staleDate: nil)) }
         #endif
     }
 
     func end(status: String) {
         #if canImport(ActivityKit)
         guard #available(iOS 16.1, *) else { return }
-        guard let a = activity else { return }
-        activity = nil
+        guard let a = activityBox as? Activity<DownloadActivityAttributes> else { return }
+        activityBox = nil
         let pct = status == "Complete" ? 100.0 : lastPct
         let st = DownloadActivityAttributes.ContentState(title: lastTitle, pct: pct, got: lastGot, total: lastTotal, status: status)
-        Task { await a.end(.init(state: st), dismissalPolicy: .immediate) }
+        Task { await a.end(.init(state: st, staleDate: nil), dismissalPolicy: .immediate) }
         #endif
     }
 }
