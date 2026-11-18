@@ -26,6 +26,16 @@ struct ShellConfig: Codable {
 let SHELL = ShellConfig.load()
 let SHELL_HOST = (SHELL.url?.host ?? "").lowercased()
 
+/* A (device-first): a download URL is allowed if it is THIS site, or a YouTube media CDN host
+   captured on-device by the resolver. One gate for start/register/batch_start — never a generic
+   fetcher for arbitrary hosts. */
+func axDownloadHostOK(_ u: URL) -> Bool {
+    let h = (u.host ?? "").lowercased()
+    if !SHELL_HOST.isEmpty && (h == SHELL_HOST || h.hasSuffix("." + SHELL_HOST)) { return true }
+    if h == "googlevideo.com" || h.hasSuffix(".googlevideo.com") { return true }
+    return false
+}
+
 struct ShellView: View {
     var body: some View {
         ShellWebView()
@@ -180,6 +190,7 @@ struct ShellWebView: UIViewRepresentable {
       window.axBatchResume = function () { try { window.webkit.messageHandlers.axBg.postMessage({ op: 'batch_resume' }); } catch (e) {} };
       window.axBatchCancel = function () { try { window.webkit.messageHandlers.axBg.postMessage({ op: 'batch_cancel' }); } catch (e) {} };
       window.axBatchState  = function () { try { window.webkit.messageHandlers.axBg.postMessage({ op: 'batch_state' }); } catch (e) {} };
+      window.axResolveUrl = function (id, script) { try { return window.webkit.messageHandlers.axResolve.postMessage({ id: String(id || ''), script: String(script || '') }); } catch (e) { return Promise.resolve(null); } };
     })();
     """
 
@@ -197,7 +208,7 @@ struct ShellWebView: UIViewRepresentable {
     """
 }
 
-final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler {
+final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler, WKScriptMessageHandlerWithReply {
     weak var web: WKWebView?
     var refresh: UIRefreshControl?
     private var offlineShown = false
@@ -243,6 +254,7 @@ final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptM
         web.configuration.userContentController.add(self, name: "axPlay")
         web.configuration.userContentController.add(self, name: "axBg")
         web.configuration.userContentController.add(self, name: "axNotify")
+        web.configuration.userContentController.addScriptMessageHandler(self, name: "axResolve")
         NativePlayer.shared.attach(web)
         AxDownloads.shared.attachWeb(web)
         NativePlayer.shared.refreshBrandArt(shellHost: SHELL_HOST)
@@ -349,6 +361,24 @@ final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptM
         web.loadHTMLString(Self.offlineHTML, baseURL: nil)
     }
 
+    /* A: device-resolve request/response. JS calls window.axResolveUrl(id, script); we run
+       YouTube's own player in a hidden resolver WebView, capture the media URLs it fetches,
+       and reply with them. The capture script comes from the website (extractor.js), so it
+       updates via ?v= with NO app reinstall. */
+    func userContentController(_ userContentController: WKUserContentController,
+                               didReceive message: WKScriptMessage,
+                               replyHandler: @escaping (Any?, String?) -> Void) {
+        if message.name == "axResolve", let d = message.body as? [String: Any] {
+            let id = d["id"] as? String ?? ""
+            let script = d["script"] as? String ?? ""
+            AxResolveCenter.shared.resolve(id: id, script: script) { urls in
+                replyHandler(urls, nil)
+            }
+            return
+        }
+        replyHandler(nil, "unknown handler")
+    }
+
     func userContentController(_ userContentController: WKUserContentController,
                                didReceive message: WKScriptMessage) {
         if message.name == "shellRetry" {
@@ -364,10 +394,7 @@ final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptM
             if op == "start" {
                 // Same-origin only: the app is a download manager for THIS site, never a
                 // generic fetcher for whatever URL a page builds.
-                if let s = d["url"] as? String, let u = URL(string: s),
-                   !SHELL_HOST.isEmpty,
-                   (u.host ?? "").lowercased() == SHELL_HOST ||
-                   (u.host ?? "").lowercased().hasSuffix("." + SHELL_HOST) {
+                if let s = d["url"] as? String, let u = URL(string: s), axDownloadHostOK(u) {
                     AxDownloads.shared.start(key: d["key"] as? String ?? "",
                                              url: u,
                                              title: d["title"] as? String ?? "")
@@ -380,9 +407,7 @@ final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptM
                     for it in raw {
                         guard let ks = it["key"] as? String, !ks.isEmpty,
                               let us = it["url"] as? String, let u = URL(string: us),
-                              !SHELL_HOST.isEmpty,
-                              (u.host ?? "").lowercased() == SHELL_HOST ||
-                              (u.host ?? "").lowercased().hasSuffix("." + SHELL_HOST) else { continue }
+                              axDownloadHostOK(u) else { continue }
                         bItems.append(["key": ks, "url": us, "title": it["title"] as? String ?? ""])
                     }
                 }
@@ -396,10 +421,7 @@ final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptM
             } else if op == "batch_state" {
                 AxBatch.shared.report()
             } else if op == "register" {
-                if let s = d["url"] as? String, let u = URL(string: s),
-                   !SHELL_HOST.isEmpty,
-                   (u.host ?? "").lowercased() == SHELL_HOST ||
-                   (u.host ?? "").lowercased().hasSuffix("." + SHELL_HOST) {
+                if let s = d["url"] as? String, let u = URL(string: s), axDownloadHostOK(u) {
                     AxDownloads.shared.register(key: d["key"] as? String ?? "",
                                                 url: u,
                                                 title: d["title"] as? String ?? "")
@@ -1951,5 +1973,65 @@ final class AxNotify: NSObject {
         let c = content(title: name, body: "Playlist ready · \(done) of \(total) files downloaded")
         c.sound = .default
         center.add(UNNotificationRequest(identifier: "ax.plfinal." + name, content: c, trigger: nil), withCompletionHandler: nil)
+    }
+}
+
+
+/* ===== A: on-device YouTube resolver (player-capture) =====
+   Runs YouTube's OWN player in a hidden WKWebView (no cookies: nonPersistent store), injects the
+   website-provided capture script, and collects the googlevideo media URLs the player fetches.
+   Their code does the signature decipher, so a YouTube player rotation does not break us. Up to
+   3 resolve in parallel; the rest queue. Each finishes on a 10s timeout with whatever was captured
+   (JS picks the format; empty => server fallback). */
+final class AxResolveCenter {
+    static let shared = AxResolveCenter()
+    private var active = 0
+    private let maxActive = 3
+    private var pending: [(String, String, ([String]) -> Void)] = []
+    func resolve(id: String, script: String, completion: @escaping ([String]) -> Void) {
+        guard !id.isEmpty else { completion([]); return }
+        if active >= maxActive { pending.append((id, script, completion)); return }
+        active += 1
+        let r = AxResolver()
+        r.start(id: id, script: script) { [weak self] urls in
+            completion(urls)
+            self?.active -= 1
+            self?.drain()
+        }
+    }
+    private func drain() {
+        guard active < maxActive, !pending.isEmpty else { return }
+        let (id, script, cb) = pending.removeFirst()
+        resolve(id: id, script: script, completion: cb)
+    }
+}
+
+final class AxResolver: NSObject, WKScriptMessageHandler {
+    private var web: WKWebView?
+    private var urls: [String] = []
+    private var done: (([String]) -> Void)?
+    private var timer: Timer?
+    func start(id: String, script: String, completion: @escaping ([String]) -> Void) {
+        done = completion
+        let cfg = WKWebViewConfiguration()
+        cfg.websiteDataStore = .nonPersistent()
+        cfg.userContentController.addUserScript(WKUserScript(source: script, injectionTime: .atDocumentStart, forMainFrameOnly: false))
+        cfg.userContentController.add(self, name: "axCap")
+        cfg.mediaTypesRequiringUserActionForPlayback = []
+        let w = WKWebView(frame: CGRect(x: 0, y: 0, width: 320, height: 180), configuration: cfg)
+        web = w
+        if let u = URL(string: "https://www.youtube.com/watch?v=" + id) { w.load(URLRequest(url: u)) }
+        timer = Timer.scheduledTimer(withTimeInterval: 10.0, repeats: false) { [weak self] _ in self?.finish() }
+    }
+    func userContentController(_ c: WKUserContentController, didReceive m: WKScriptMessage) {
+        if m.name == "axCap", let s = m.body as? String, !urls.contains(s) { urls.append(s) }
+    }
+    private func finish() {
+        timer?.invalidate(); timer = nil
+        let result = urls
+        let cb = done; done = nil
+        web?.configuration.userContentController.removeScriptMessageHandler(forName: "axCap")
+        web?.stopLoading(); web = nil
+        cb?(result)
     }
 }
