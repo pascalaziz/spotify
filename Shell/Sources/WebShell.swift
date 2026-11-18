@@ -190,7 +190,17 @@ struct ShellWebView: UIViewRepresentable {
       window.axBatchResume = function () { try { window.webkit.messageHandlers.axBg.postMessage({ op: 'batch_resume' }); } catch (e) {} };
       window.axBatchCancel = function () { try { window.webkit.messageHandlers.axBg.postMessage({ op: 'batch_cancel' }); } catch (e) {} };
       window.axBatchState  = function () { try { window.webkit.messageHandlers.axBg.postMessage({ op: 'batch_state' }); } catch (e) {} };
-      window.axResolveUrl = function (id, script) { try { return window.webkit.messageHandlers.axResolve.postMessage({ id: String(id || ''), script: String(script || '') }); } catch (e) { return Promise.resolve(null); } };
+      window.__axResolveCbs = {}; window.__axResolveSeq = 0;
+      window.__axResolveCb = function (cb, urls) { var r = window.__axResolveCbs[cb]; if (r) { delete window.__axResolveCbs[cb]; r(urls || []); } };
+      window.axResolveUrl = function (id, script) {
+        return new Promise(function (resolve) {
+          try {
+            var cb = ++window.__axResolveSeq; window.__axResolveCbs[cb] = resolve;
+            window.webkit.messageHandlers.axResolve.postMessage({ id: String(id || ''), script: String(script || ''), cb: cb });
+            setTimeout(function () { if (window.__axResolveCbs[cb]) { delete window.__axResolveCbs[cb]; resolve(null); } }, 16000);
+          } catch (e) { resolve(null); }
+        });
+      };
     })();
     """
 
@@ -254,7 +264,7 @@ final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptM
         web.configuration.userContentController.add(self, name: "axPlay")
         web.configuration.userContentController.add(self, name: "axBg")
         web.configuration.userContentController.add(self, name: "axNotify")
-        web.configuration.userContentController.add(AxResolveHandler.shared, name: "axResolve")
+        web.configuration.userContentController.add(self, name: "axResolve")
         NativePlayer.shared.attach(web)
         AxDownloads.shared.attachWeb(web)
         NativePlayer.shared.refreshBrandArt(shellHost: SHELL_HOST)
@@ -367,6 +377,20 @@ final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptM
             offlineShown = false
             offlineTriedCache = false
             if let url = SHELL.url { web?.load(URLRequest(url: url)) }
+        }
+        if message.name == "axResolve", let d = message.body as? [String: Any] {
+            /* A: device-resolve. Run YouTube's own player in a hidden resolver WebView, capture the
+               media URLs, and call back into the page (same one-way pattern as axBg/axNotify). The
+               capture script comes from the website (extractor.js) -> updates via ?v=, no reinstall. */
+            let id = d["id"] as? String ?? ""
+            let script = d["script"] as? String ?? ""
+            let cb = d["cb"] as? Int ?? 0
+            AxResolveCenter.shared.resolve(id: id, script: script) { [weak self] urls in
+                if let data = try? JSONSerialization.data(withJSONObject: urls, options: []),
+                   let json = String(data: data, encoding: .utf8) {
+                    self?.web?.evaluateJavaScript("window.__axResolveCb&&window.__axResolveCb(\(cb), \(json))", completionHandler: nil)
+                }
+            }
         }
         if message.name == "axPlay", let d = message.body as? [String: Any] {
             NativePlayer.shared.message(d)
@@ -1965,23 +1989,6 @@ final class AxNotify: NSObject {
    Their code does the signature decipher, so a YouTube player rotation does not break us. Up to
    3 resolve in parallel; the rest queue. Each finishes on a 10s timeout with whatever was captured
    (JS picks the format; empty => server fallback). */
-/* A: reply-based bridge handler (separate object so add(_:name:) resolves unambiguously to the
-   WKScriptMessageHandlerWithReply overload). JS window.axResolveUrl(id, script) -> native resolve. */
-final class AxResolveHandler: NSObject, WKScriptMessageHandlerWithReply {
-    static let shared = AxResolveHandler()
-    func userContentController(_ userContentController: WKUserContentController,
-                               didReceive message: WKScriptMessage,
-                               replyHandler: @escaping (Any?, String?) -> Void) {
-        if message.name == "axResolve", let d = message.body as? [String: Any] {
-            let id = d["id"] as? String ?? ""
-            let script = d["script"] as? String ?? ""
-            AxResolveCenter.shared.resolve(id: id, script: script) { urls in replyHandler(urls, nil) }
-            return
-        }
-        replyHandler(nil, "unknown handler")
-    }
-}
-
 final class AxResolveCenter {
     static let shared = AxResolveCenter()
     private var active = 0
