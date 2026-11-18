@@ -208,7 +208,7 @@ struct ShellWebView: UIViewRepresentable {
     """
 }
 
-final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler, WKScriptMessageHandlerWithReply {
+final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler {
     weak var web: WKWebView?
     var refresh: UIRefreshControl?
     private var offlineShown = false
@@ -254,7 +254,7 @@ final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptM
         web.configuration.userContentController.add(self, name: "axPlay")
         web.configuration.userContentController.add(self, name: "axBg")
         web.configuration.userContentController.add(self, name: "axNotify")
-        web.configuration.userContentController.addScriptMessageHandler(self, name: "axResolve")
+        web.configuration.userContentController.add(AxResolveHandler.shared, name: "axResolve")
         NativePlayer.shared.attach(web)
         AxDownloads.shared.attachWeb(web)
         NativePlayer.shared.refreshBrandArt(shellHost: SHELL_HOST)
@@ -359,24 +359,6 @@ final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptM
         guard !offlineShown else { return }
         offlineShown = true
         web.loadHTMLString(Self.offlineHTML, baseURL: nil)
-    }
-
-    /* A: device-resolve request/response. JS calls window.axResolveUrl(id, script); we run
-       YouTube's own player in a hidden resolver WebView, capture the media URLs it fetches,
-       and reply with them. The capture script comes from the website (extractor.js), so it
-       updates via ?v= with NO app reinstall. */
-    func userContentController(_ userContentController: WKUserContentController,
-                               didReceive message: WKScriptMessage,
-                               replyHandler: @escaping (Any?, String?) -> Void) {
-        if message.name == "axResolve", let d = message.body as? [String: Any] {
-            let id = d["id"] as? String ?? ""
-            let script = d["script"] as? String ?? ""
-            AxResolveCenter.shared.resolve(id: id, script: script) { urls in
-                replyHandler(urls, nil)
-            }
-            return
-        }
-        replyHandler(nil, "unknown handler")
     }
 
     func userContentController(_ userContentController: WKUserContentController,
@@ -1983,6 +1965,23 @@ final class AxNotify: NSObject {
    Their code does the signature decipher, so a YouTube player rotation does not break us. Up to
    3 resolve in parallel; the rest queue. Each finishes on a 10s timeout with whatever was captured
    (JS picks the format; empty => server fallback). */
+/* A: reply-based bridge handler (separate object so add(_:name:) resolves unambiguously to the
+   WKScriptMessageHandlerWithReply overload). JS window.axResolveUrl(id, script) -> native resolve. */
+final class AxResolveHandler: NSObject, WKScriptMessageHandlerWithReply {
+    static let shared = AxResolveHandler()
+    func userContentController(_ userContentController: WKUserContentController,
+                               didReceive message: WKScriptMessage,
+                               replyHandler: @escaping (Any?, String?) -> Void) {
+        if message.name == "axResolve", let d = message.body as? [String: Any] {
+            let id = d["id"] as? String ?? ""
+            let script = d["script"] as? String ?? ""
+            AxResolveCenter.shared.resolve(id: id, script: script) { urls in replyHandler(urls, nil) }
+            return
+        }
+        replyHandler(nil, "unknown handler")
+    }
+}
+
 final class AxResolveCenter {
     static let shared = AxResolveCenter()
     private var active = 0
