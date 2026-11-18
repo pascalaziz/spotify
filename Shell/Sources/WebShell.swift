@@ -1111,6 +1111,9 @@ final class AxDownloads: NSObject {
        media. Now: content-validated, and retried NATIVELY with earliestBeginDate so iOS re-runs
        the task in the background daemon (no app wake-up needed) until the file is ready. */
     private var retries: [String: Int] = [:]
+    /* RESUME-RETRY BUDGET (2026-11-18): how many times this key has been re-armed from Apple's resume
+       data. Bounded so a permanently broken URL cannot loop, but never resets the byte offset. */
+    private var resumeTries: [String: Int] = [:]
     private static let maxWaitRetries = 80          // 80 x 15 s = 20 min (the rip ceiling)
     private static let retryDelay: TimeInterval = 15
     /* SPOTIFY-STYLE BACKGROUND HANDOFF (his order: downloads must continue when he switches apps
@@ -1141,6 +1144,7 @@ final class AxDownloads: NSObject {
         NotificationCenter.default.addObserver(forName: UIApplication.didEnterBackgroundNotification,
                                                object: nil, queue: .main) { [weak self] _ in
             self?.startAllRegistered()
+            self?.snapshotNotifications()
         }
         /* BACKGROUND TAKEOVER (2026-11-17, his order: downloads must survive app-switch/screen-off).
            The web layer cannot be trusted to react at hide-time — iOS freezes WKWebView JS around
@@ -1171,6 +1175,24 @@ final class AxDownloads: NSObject {
 
     func attachWeb(_ w: WKWebView?) { web = w }
 
+    /* LOCK SCREEN AT THE MOMENT OF BACKGROUNDING (2026-11-18): the previous design only posted a
+       progress notification from the NEXT delegate callback, which on a slow link can be many seconds
+       after the user locks the screen - so the Lock Screen looked empty. This pushes the live byte
+       counts immediately, for every task the background session owns. */
+    private func snapshotNotifications() {
+        session.getAllTasks { [weak self] ts in
+            guard let self = self else { return }
+            for t in ts {
+                guard let k = t.taskDescription, !k.isEmpty else { continue }
+                let got = Int(t.countOfBytesReceived)
+                let total = Int(max(0, t.countOfBytesExpectedToReceive))
+                DispatchQueue.main.async {
+                    AxNotify.shared.progressNow(key: k, title: self.meta[k]?["title"] ?? k, got: got, total: total)
+                }
+            }
+        }
+    }
+
     func handleBackgroundEvents(_ completionHandler: @escaping () -> Void) {
         bgCompletion = completionHandler
     }
@@ -1187,6 +1209,31 @@ final class AxDownloads: NSObject {
         if let attrs = try? FileManager.default.attributesOfItem(atPath: dest.path),
            let sz = attrs[.size] as? Int, sz > 0 {
             DispatchQueue.main.async { self.emit(key: key, type: "done", got: sz, total: sz, msg: "") }
+            return
+        }
+        /* Ask for notification permission on the first real download: the tap that started it is the
+           user gesture iOS wants, and without it the Lock Screen has nothing to show. */
+        AxNotify.shared.requestOnce()
+        /* RESUME, NEVER RESTART: a task that died mid-transfer left Apple's resume data behind. The
+           next start continues from that byte offset instead of re-pulling the file from zero (the
+           "92% -> back to 0%" report, where the file was already complete). */
+        let rdKey = "ax.bg.resume." + key
+        if let rd = UserDefaults.standard.data(forKey: rdKey), !rd.isEmpty {
+            session.getAllTasks { [weak self] ts in
+                guard let self = self else { return }
+                if ts.contains(where: { $0.taskDescription == key }) { self.syncToPage(); return }
+                DispatchQueue.main.async {
+                    self.meta[key] = ["title": title, "url": url.absoluteString,
+                                      "started": String(Date().timeIntervalSince1970)]
+                    if waitReady { self.meta[key]?["wait"] = "1" }
+                    self.saveMeta()
+                    let t = self.session.downloadTask(withResumeData: rd)
+                    t.taskDescription = key
+                    t.resume()
+                    AxNotify.shared.progressNow(key: key, title: title.isEmpty ? key : title, got: 0, total: 0)
+                    self.emit(key: key, type: "start", got: 0, total: 0, msg: "resume")
+                }
+            }
             return
         }
         session.getAllTasks { [weak self] ts in
@@ -1374,6 +1421,8 @@ extension AxDownloads: URLSessionDownloadDelegate, URLSessionDataDelegate {
             return
         }
         retries[key] = nil
+        resumeTries[key] = nil
+        UserDefaults.standard.removeObject(forKey: "ax.bg.resume." + key)
         size = ((try? fm.attributesOfItem(atPath: dest.path))?[FileAttributeKey.size] as? Int) ?? 0
         DispatchQueue.main.async {
             let t = self.meta[key]?["title"] ?? ""
@@ -1416,6 +1465,36 @@ extension AxDownloads: URLSessionDownloadDelegate, URLSessionDataDelegate {
         guard let err = error else { return }
         let key = task.taskDescription ?? ""
         guard !key.isEmpty else { return }
+        /* RECONNECT FROM THE BYTES WE ALREADY HAVE (2026-11-18). iOS hands back resume data for a
+           transfer that died mid-flight; keeping it and re-arming the task means the next attempt
+           continues at that offset. Clearing it (what this did before) is what made the retry start
+           again from 0% while the file was already complete. */
+        if let rd = (err as NSError).userInfo[NSURLSessionDownloadTaskResumeData] as? Data, !rd.isEmpty {
+            UserDefaults.standard.set(rd, forKey: "ax.bg.resume." + key)
+            let n = (resumeTries[key] ?? 0) + 1
+            resumeTries[key] = n
+            DispatchQueue.main.async {
+                let t = self.meta[key]?["title"] ?? key
+                let got = Int(task.countOfBytesReceived)
+                let total = Int(max(0, task.countOfBytesExpectedToReceive))
+                AxNotify.shared.progressNow(key: key, title: t, got: got, total: total)
+                self.emit(key: key, type: "progress", got: got, total: total, msg: "reconnecting")
+                if n <= 8, let urlS = self.meta[key]?["url"], let u = URL(string: urlS) {
+                    let delay = min(30.0, Double(n) * 3.0)
+                    DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+                        guard let self = self else { return }
+                        self.start(key: key, url: u, title: t,
+                                   waitReady: self.meta[key]?["wait"] == "1")
+                    }
+                } else {
+                    self.resumeTries[key] = nil
+                    self.clearMeta(key)
+                    AxNotify.shared.failed(key: key, title: t.isEmpty ? key : t, error: err.localizedDescription)
+                    self.emit(key: key, type: "error", got: 0, total: 0, msg: err.localizedDescription)
+                }
+            }
+            return
+        }
         DispatchQueue.main.async {
             let t = self.meta[key]?["title"] ?? ""
             AxActivity.shared.end(status: "Failed")
@@ -1600,6 +1679,19 @@ final class AxNotify: NSObject {
         let c = content(title: title, body: body.isEmpty ? "Downloading…" : body)
         let req = UNNotificationRequest(identifier: "ax.dl." + key, content: c, trigger: nil)
         center.add(req, withCompletionHandler: nil)
+    }
+
+    /* Un-throttled, state-independent snapshot: only called at background-time (and on a reconnect),
+       where "the user just locked the screen" is exactly when the Lock Screen must show something. */
+    func progressNow(key: String, title: String, got: Int, total: Int) {
+        guard allowed, !key.isEmpty, !title.isEmpty else { return }
+        lastProgress[key] = Date()
+        var body = ""
+        let pct = total > 0 ? Int(Double(got) / Double(total) * 100) : 0
+        if pct > 0 { body = "\(pct)%" }
+        if total > 0 { body += (body.isEmpty ? "" : " · ") + "\(Self.humanSize(got)) / \(Self.humanSize(total))" }
+        let c = content(title: title, body: body.isEmpty ? "Downloading..." : body)
+        center.add(UNNotificationRequest(identifier: "ax.dl." + key, content: c, trigger: nil), withCompletionHandler: nil)
     }
 
     func completed(key: String, title: String) {
