@@ -161,6 +161,25 @@ struct ShellWebView: UIViewRepresentable {
       window.axNotifyPermission = function () {
         try { window.webkit.messageHandlers.axNotify.postMessage({ kind: 'perm' }); } catch (e) {}
       };
+      /* NATIVE BATCH QUEUE (2026-11-18). The page hands the WHOLE list ONCE; iOS then downloads them
+         one after another in the background session with no page involvement at all (no per-item
+         round trips, no waiting for a render, survives a WebView reload). Same 'axbg' event channel:
+         type 'batch' carries the whole queue state, so the panel keeps rendering exactly as before. */
+      window.axBatchStart = function (spec) {
+        try {
+          window.webkit.messageHandlers.axBg.postMessage({
+            op: 'batch_start', name: String(spec.name || 'Downloads'),
+            items: (spec.items || []).map(function (i) {
+              return { key: String(i.key || ''), url: String(i.url || ''), title: String(i.title || '') };
+            })
+          });
+          return true;
+        } catch (e) { return false; }
+      };
+      window.axBatchPause  = function () { try { window.webkit.messageHandlers.axBg.postMessage({ op: 'batch_pause' }); } catch (e) {} };
+      window.axBatchResume = function () { try { window.webkit.messageHandlers.axBg.postMessage({ op: 'batch_resume' }); } catch (e) {} };
+      window.axBatchCancel = function () { try { window.webkit.messageHandlers.axBg.postMessage({ op: 'batch_cancel' }); } catch (e) {} };
+      window.axBatchState  = function () { try { window.webkit.messageHandlers.axBg.postMessage({ op: 'batch_state' }); } catch (e) {} };
     })();
     """
 
@@ -355,6 +374,27 @@ final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptM
                 }
             } else if op == "cancel" {
                 AxDownloads.shared.cancel(key: d["key"] as? String ?? "")
+            } else if op == "batch_start" {
+                var bItems: [[String: String]] = []
+                if let raw = d["items"] as? [[String: Any]] {
+                    for it in raw {
+                        guard let ks = it["key"] as? String, !ks.isEmpty,
+                              let us = it["url"] as? String, let u = URL(string: us),
+                              !SHELL_HOST.isEmpty,
+                              (u.host ?? "").lowercased() == SHELL_HOST ||
+                              (u.host ?? "").lowercased().hasSuffix("." + SHELL_HOST) else { continue }
+                        bItems.append(["key": ks, "url": us, "title": it["title"] as? String ?? ""])
+                    }
+                }
+                AxBatch.shared.start(name: d["name"] as? String ?? "Downloads", items: bItems)
+            } else if op == "batch_pause" {
+                AxBatch.shared.pause()
+            } else if op == "batch_resume" {
+                AxBatch.shared.resume()
+            } else if op == "batch_cancel" {
+                AxBatch.shared.cancelAll()
+            } else if op == "batch_state" {
+                AxBatch.shared.report()
             } else if op == "register" {
                 if let s = d["url"] as? String, let u = URL(string: s),
                    !SHELL_HOST.isEmpty,
@@ -1175,6 +1215,9 @@ final class AxDownloads: NSObject {
 
     func attachWeb(_ w: WKWebView?) { web = w }
 
+    /* Used by AxBatch: one 'batch' event carries the whole queue state. */
+    func emitBatch(_ json: String) { emitRaw(json) }
+
     /* LOCK SCREEN AT THE MOMENT OF BACKGROUNDING (2026-11-18): the previous design only posted a
        progress notification from the NEXT delegate callback, which on a slow link can be many seconds
        after the user locks the screen - so the Lock Screen looked empty. This pushes the live byte
@@ -1417,6 +1460,7 @@ extension AxDownloads: URLSessionDownloadDelegate, URLSessionDataDelegate {
                 self.clearMeta(key)
                 AxNotify.shared.failed(key: key, title: t, error: "the server job never became ready")
                 self.emit(key: key, type: "error", got: 0, total: 0, msg: "server job never became ready")
+                NotificationCenter.default.post(name: .axDlFailed, object: nil, userInfo: ["key": key])
             }
             return
         }
@@ -1430,6 +1474,8 @@ extension AxDownloads: URLSessionDownloadDelegate, URLSessionDataDelegate {
             AxNotify.shared.completed(key: key, title: t.isEmpty ? key : t)
             AxActivity.shared.end(status: "Complete")
             self.emit(key: key, type: "done", got: size, total: size, msg: "")
+            NotificationCenter.default.post(name: .axDlFinished, object: nil,
+                                            userInfo: ["key": key, "size": size])
             self.syncToPage()
         }
     }
@@ -1506,6 +1552,7 @@ extension AxDownloads: URLSessionDownloadDelegate, URLSessionDataDelegate {
             AxNotify.shared.failed(key: key, title: t.isEmpty ? key : t, error: err.localizedDescription)
             self.emit(key: key, type: "error", got: 0, total: 0,
                       msg: err.localizedDescription)
+            NotificationCenter.default.post(name: .axDlFailed, object: nil, userInfo: ["key": key])
         }
     }
 
@@ -1518,6 +1565,176 @@ extension AxDownloads: URLSessionDownloadDelegate, URLSessionDataDelegate {
     }
 }
 
+
+/* ---------- NATIVE BATCH QUEUE (2026-11-18) ----------
+ * THE REASON THIS EXISTS: the download queue used to live in JavaScript. Every item needed the page
+ * to schedule it, so a slow render / a playlist read / a reloaded WebView could stall a batch, and a
+ * row could sit at 99% while the file was already in the library. The page now hands the WHOLE list
+ * over ONCE; iOS downloads them one after another inside the background session, keeps the queue in
+ * its own persisted state (a relaunch continues it), and reports the whole queue on the 'axbg'
+ * channel. Nothing in the UI sits between two files: the next task is created from the completion
+ * callback, in the same run loop.
+ */
+extension Notification.Name {
+    static let axDlFinished = Notification.Name("ax.dl.finished")
+    static let axDlFailed   = Notification.Name("ax.dl.failed")
+}
+
+final class AxBatch {
+    static let shared = AxBatch()
+
+    private struct Item: Codable {
+        var key: String
+        var url: String
+        var title: String
+        var status: String          // queued | running | done | failed | cancelled
+        var got: Int
+        var total: Int
+    }
+
+    private var items: [Item] = []
+    private var batchName = ""
+    private var paused = false
+    private var stopped = false
+    private let storeKey = "ax.batch.state"
+
+    private init() {
+        let nc = NotificationCenter.default
+        nc.addObserver(forName: .axDlFinished, object: nil, queue: .main) { [weak self] n in
+            guard let self = self, let k = n.userInfo?["key"] as? String else { return }
+            self.markDone(key: k, size: (n.userInfo?["size"] as? Int) ?? 0)
+        }
+        nc.addObserver(forName: .axDlFailed, object: nil, queue: .main) { [weak self] n in
+            guard let self = self, let k = n.userInfo?["key"] as? String else { return }
+            self.markFailed(key: k)
+        }
+        /* A batch outlives the page AND the process: on the next foreground, keep going. */
+        nc.addObserver(forName: UIApplication.willEnterForegroundNotification, object: nil, queue: .main) { [weak self] _ in
+            guard let self = self else { return }
+            self.report()
+            self.pump()
+        }
+        load()
+    }
+
+    // MARK: page-facing API
+
+    func start(name: String, items list: [[String: String]]) {
+        guard !list.isEmpty else { return }
+        batchName = name.isEmpty ? "Downloads" : name
+        items = list.map { d in
+            Item(key: d["key"] ?? "", url: d["url"] ?? "", title: d["title"] ?? "",
+                 status: "queued", got: 0, total: 0)
+        }.filter { !$0.key.isEmpty && !$0.url.isEmpty }
+        paused = false
+        stopped = false
+        save()
+        emit()
+        pump()                      // first file starts NOW - no page round trip
+    }
+
+    func pause() {
+        paused = true
+        emit()
+    }
+
+    func resume() {
+        paused = false
+        stopped = false
+        emit()
+        pump()
+    }
+
+    func cancelAll() {
+        stopped = true
+        for i in items.indices where items[i].status == "queued" || items[i].status == "running" {
+            if items[i].status == "running" { AxDownloads.shared.cancel(key: items[i].key) }
+            items[i].status = "cancelled"
+        }
+        save()
+        emit()
+    }
+
+    func report() { emit() }
+
+    // MARK: queue engine
+
+    private func pump() {
+        guard !paused, !stopped else { return }
+        guard !items.contains(where: { $0.status == "running" }) else { return }
+        guard let idx = items.firstIndex(where: { $0.status == "queued" }) else { return }
+        items[idx].status = "running"
+        save()
+        emit()
+        /* waitReady: the server may still be ripping; the background task retries ITSELF with
+           earliestBeginDate until the file is real, with zero page involvement. */
+        AxDownloads.shared.start(key: items[idx].key,
+                                 url: URL(string: items[idx].url)!,
+                                 title: items[idx].title,
+                                 waitReady: true)
+    }
+
+    private func markDone(key: String, size: Int) {
+        guard let idx = items.firstIndex(where: { $0.key == key }) else { return }
+        if items[idx].status == "done" { return }          // idempotent: duplicate events are harmless
+        items[idx].status = "done"
+        items[idx].got = size
+        items[idx].total = size
+        save()
+        emit()
+        pump()                                             // next file, immediately
+    }
+
+    private func markFailed(key: String) {
+        guard let idx = items.firstIndex(where: { $0.key == key }) else { return }
+        if items[idx].status == "done" { return }
+        items[idx].status = "failed"
+        save()
+        emit()
+        pump()
+    }
+
+    // MARK: persistence + reporting
+
+    private func save() {
+        if let d = try? JSONEncoder().encode(items) {
+            UserDefaults.standard.set(d, forKey: storeKey)
+            UserDefaults.standard.set(batchName, forKey: storeKey + ".name")
+        }
+    }
+
+    private func load() {
+        if let d = UserDefaults.standard.data(forKey: storeKey),
+           let list = try? JSONDecoder().decode([Item].self, from: d) {
+            items = list
+        }
+        batchName = UserDefaults.standard.string(forKey: storeKey + ".name") ?? ""
+        /* Anything that was mid-flight died with the process: re-queue it. */
+        for i in items.indices where items[i].status == "running" {
+            items[i].status = "queued"
+        }
+    }
+
+    private func emit() {
+        let done = items.filter { $0.status == "done" }.count
+        let parts: [String] = items.map { i in
+            let pct = i.total > 0 ? Int(Double(i.got) / Double(i.total) * 100) : 0
+            return "{\"key\":\"" + AxBatch.esc(i.key) + "\",\"status\":\"" + AxBatch.esc(i.status)
+                 + "\",\"got\":" + String(i.got) + ",\"total\":" + String(i.total)
+                 + ",\"pct\":" + String(pct) + ",\"title\":\"" + AxBatch.esc(i.title) + "\"}"
+        }
+        let json = "{type:'batch',name:'" + AxBatch.esc(batchName) + "',done:" + String(done)
+                 + ",total:" + String(items.count) + ",paused:" + (paused ? "true" : "false")
+                 + ",cancelled:" + (stopped ? "true" : "false") + ",items:[" + parts.joined(separator: ",") + "]}"
+        AxDownloads.shared.emitBatch(json)
+    }
+
+    private static func esc(_ s: String) -> String {
+        return s.replacingOccurrences(of: "\\", with: "\\\\")
+                .replacingOccurrences(of: "\"", with: "\\\"")
+                .replacingOccurrences(of: "\n", with: " ")
+    }
+}
 
 /* ---------- LIVE ACTIVITY (2026-11-17) ----------
    ActivityKit Live Activity for the CURRENT download: Lock Screen + Dynamic Island.
