@@ -1184,6 +1184,10 @@ final class AxDownloads: NSObject {
     /* A: live download speed (bytes/sec), EMA-smoothed per key from real URLSession byte callbacks. */
     private var speedState: [String: (last: Int64, time: Date, ema: Double)] = [:]
     private var pending: [String: String] = [:]
+    /* MP4 device merge (adaptive video+audio): staged files + a serial queue guarding them. */
+    private var pairVideo: [String: URL] = [:]
+    private var pairAudio: [String: URL] = [:]
+    private let pairQ = DispatchQueue(label: "ax.pair.merge")
     /* WAIT-READY RETRIES: backgrounding during the server rip phase hands a serve URL whose job
        is not final yet; the serve answers 404 JSON. The engine used to save that JSON AS the
        media. Now: content-validated, and retried NATIVELY with earliestBeginDate so iOS re-runs
@@ -1378,6 +1382,82 @@ final class AxDownloads: NSObject {
             self.emit(key: key, type: "done", got: sz, total: sz, msg: "")
             NotificationCenter.default.post(name: .axDlFinished, object: nil, userInfo: ["key": key, "size": sz])
             self.syncToPage()
+        }
+    }
+
+    /* Entry that understands a single captured URL OR a captured video+audio PAIR
+       ("axpair\n<video>\n<audio>") that the device merges into one mp4 (adaptive streams). */
+    func startPicked(key: String, picked: String, title: String, waitReady: Bool) {
+        if picked.hasPrefix("axpair\n") {
+            let p = picked.split(separator: "\n", omittingEmptySubsequences: false)
+            if p.count >= 3 { startPair(key: key, video: String(p[1]), audio: String(p[2]), title: title); return }
+        }
+        if let u = URL(string: picked) { start(key: key, url: u, title: title, waitReady: waitReady); return }
+        DispatchQueue.main.async { NotificationCenter.default.post(name: .axDlFailed, object: nil, userInfo: ["key": key]) }
+    }
+    private func startPair(key: String, video: String, audio: String, title: String) {
+        guard let vu = URL(string: video), let au = URL(string: audio) else { failPair(key); return }
+        AxNotify.shared.requestOnce()
+        meta[key] = ["title": title, "url": video, "started": String(Date().timeIntervalSince1970)]
+        saveMeta()
+        emit(key: key, type: "start", got: 0, total: 0, msg: "")
+        URLSession.shared.downloadTask(with: au) { [weak self] loc, _, err in
+            guard let self = self else { return }
+            guard let loc = loc, err == nil else { self.failPair(key); return }
+            self.pairQ.async { self.pairAudio[key] = loc; self.tryMergePair(key, title: title) }
+        }.resume()
+        AxAccelerator.shared.attempt(key: key, url: vu, title: title,
+            onProgress: { [weak self] k, got, total, sp in DispatchQueue.main.async { self?.accelProgress(k, got: got, total: total, speed: sp) } },
+            onComplete: { [weak self] k, file, _ in self?.pairQ.async { self?.pairVideo[k] = file; self?.tryMergePair(k, title: title) } },
+            onFail: { [weak self] k in
+                guard let self = self else { return }
+                URLSession.shared.downloadTask(with: vu) { loc, _, err in
+                    guard let loc = loc, err == nil else { self.failPair(k); return }
+                    self.pairQ.async { self.pairVideo[k] = loc; self.tryMergePair(k, title: title) }
+                }.resume()
+            })
+    }
+    private func tryMergePair(_ key: String, title: String) {
+        guard let vFile = pairVideo[key], let aFile = pairAudio[key] else { return }
+        pairVideo[key] = nil; pairAudio[key] = nil
+        let vAsset = AVURLAsset(url: vFile), aAsset = AVURLAsset(url: aFile)
+        let comp = AVMutableComposition()
+        guard let vTrack = vAsset.tracks(withMediaType: .video).first,
+              let aTrack = aAsset.tracks(withMediaType: .audio).first,
+              let cV = comp.addMutableTrack(withMediaType: .video, preferredTrackID: kCMPersistentTrackID_Invalid),
+              let cA = comp.addMutableTrack(withMediaType: .audio, preferredTrackID: kCMPersistentTrackID_Invalid) else { failPair(key); return }
+        do {
+            try cV.insertTimeRange(CMTimeRange(start: .zero, duration: vAsset.duration), of: vTrack, at: .zero)
+            try cA.insertTimeRange(CMTimeRange(start: .zero, duration: CMTimeMinimum(vAsset.duration, aAsset.duration)), of: aTrack, at: .zero)
+        } catch { failPair(key); return }
+        let out = libURL(key); try? FileManager.default.removeItem(at: out)
+        guard let ex = AVAssetExportSession(asset: comp, presetName: AVAssetExportPresetPassthrough) else { failPair(key); return }
+        ex.outputURL = out
+        ex.outputFileType = .mp4
+        ex.exportAsynchronously { [weak self] in
+            guard let self = self else { return }
+            if ex.status == .completed {
+                DispatchQueue.main.async {
+                    let t = self.meta[key]?["title"] ?? title
+                    self.clearMeta(key); self.speedState.removeValue(forKey: key)
+                    let sz = ((try? FileManager.default.attributesOfItem(atPath: out.path))?[FileAttributeKey.size] as? Int) ?? 0
+                    AxNotify.shared.completed(key: key, title: t.isEmpty ? key : t)
+                    AxActivity.shared.end(status: "Complete")
+                    self.emit(key: key, type: "done", got: sz, total: sz, msg: "")
+                    NotificationCenter.default.post(name: .axDlFinished, object: nil, userInfo: ["key": key, "size": sz])
+                    self.syncToPage()
+                }
+            } else { self.failPair(key) }
+        }
+    }
+    private func failPair(_ key: String) {
+        pairQ.async { self.pairVideo.removeValue(forKey: key); self.pairAudio.removeValue(forKey: key) }
+        DispatchQueue.main.async {
+            let t = self.meta[key]?["title"] ?? key
+            self.clearMeta(key)
+            AxNotify.shared.failed(key: key, title: t, error: "device merge failed")
+            self.emit(key: key, type: "error", got: 0, total: 0, msg: "device merge failed")
+            NotificationCenter.default.post(name: .axDlFailed, object: nil, userInfo: ["key": key])
         }
     }
 
@@ -1847,9 +1927,16 @@ final class AxAccelerator: NSObject, URLSessionDownloadDelegate {
         }
         fh.closeFile()
         let size = ((try? FileManager.default.attributesOfItem(atPath: out.path))?[FileAttributeKey.size] as? Int) ?? Int(job.total)
+        /* HANDOFF: cleanupLocked removes the job dir, which CONTAINS `out`. Move the assembled file to a
+           safe temp path FIRST — else the completion hands back a deleted file and every download silently
+           re-runs via startSingle (the "redownload is slower / speed wrong" bug). */
+        let safe = FileManager.default.temporaryDirectory.appendingPathComponent("axaccel-done-" + key.replacingOccurrences(of: "/", with: "_").replacingOccurrences(of: ":", with: "_"))
+        try? FileManager.default.removeItem(at: safe)
+        try? FileManager.default.moveItem(at: out, to: safe)
+        let handed = ((try? FileManager.default.attributesOfItem(atPath: safe.path)) != nil) ? safe : out
         let cb = cbComplete[key]
         cleanupLocked(key)
-        DispatchQueue.main.async { cb?(key, out, size) }
+        DispatchQueue.main.async { cb?(key, handed, size) }
     }
 
     func urlSession(_ s: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
@@ -2008,11 +2095,11 @@ final class AxBatch {
         if let vid = axVideoIdSwift(src) {   // resolver falls back to the baked-in script when batchScript is empty
             /* INSTANT START: a pre-resolve already captured this item while the previous one downloaded,
                so its turn begins with zero resolve wait (the "stuck on Starting" fix). */
-            if let cached = preresolved[key], let u = URL(string: cached) {
+            if let cached = preresolved[key] {
                 preresolved.removeValue(forKey: key)
                 items[idx].url = cached; items[idx].via = "device"; items[idx].phase = "Downloading"
                 save(); emit()
-                AxDownloads.shared.start(key: key, url: u, title: title, waitReady: false)
+                AxDownloads.shared.startPicked(key: key, picked: cached, title: title, waitReady: false)
                 preresolveNext()
                 return
             }
@@ -2020,10 +2107,10 @@ final class AxBatch {
             AxResolveCenter.shared.resolve(id: vid, script: batchScript, fmt: fmt) { [weak self] urls in
                 guard let self = self else { return }
                 guard idx < self.items.count, self.items[idx].key == key, self.items[idx].status == "running" else { return }
-                if let picked = axPickStreamSwift(urls, fmt: fmt, res: res), let u = URL(string: picked) {
+                if let picked = axPickStreamSwift(urls, fmt: fmt, res: res) {
                     self.items[idx].url = picked; self.items[idx].via = "device"; self.items[idx].phase = "Downloading"
                     self.save(); self.emit()
-                    AxDownloads.shared.start(key: key, url: u, title: title, waitReady: false)
+                    AxDownloads.shared.startPicked(key: key, picked: picked, title: title, waitReady: false)
                     self.preresolveNext()
                 } else {
                     /* A SINGLE pick must always complete — it was server-backed before and some sources
@@ -2556,6 +2643,18 @@ func axItagOf(_ url: String) -> Int? {
     if let s = q.first(where: { $0.name == "itag" })?.value { return Int(s) }
     return nil
 }
+func axPickVideoItag(_ urls: [String], maxH: Int) -> String? {
+    // m4 (avc1) video-only itags -> height; highest that fits maxH (device merge caps at 720p).
+    let ladder: [(Int, Int)] = [(137,1080),(136,720),(135,480),(134,360),(133,240),(160,144)]
+    for (it, h) in ladder where h <= maxH && h <= 720 {
+        if let u = urls.first(where: { axItagOf($0) == it }) { return u }
+    }
+    return nil
+}
+func axPickAudioItag(_ urls: [String]) -> String? {
+    for it in [140, 251, 250, 249, 141] { if let u = urls.first(where: { axItagOf($0) == it }) { return u } }
+    return nil
+}
 func axPickStreamSwift(_ urls: [String], fmt: String, res: String) -> String? {
     if fmt == "mp3" {
         for it in [140, 141, 251, 250, 249] { if let u = urls.first(where: { axItagOf($0) == it }) { return u } }
@@ -2566,6 +2665,10 @@ func axPickStreamSwift(_ urls: [String], fmt: String, res: String) -> String? {
         if maxH >= 720, let u = urls.first(where: { axItagOf($0) == 22 }) { return u }
         if let u = urls.first(where: { axItagOf($0) == 18 }) { return u }
         if let u = urls.first(where: { axItagOf($0) == 22 }) { return u }
+    }
+    // No muxed stream: merge a separate m4 video + m4a audio ON the device (zero host, <=720p).
+    if let v = axPickVideoItag(urls, maxH: min(maxH, 720)), let a = axPickAudioItag(urls) {
+        return "axpair\n" + v + "\n" + a
     }
     return nil   // >720p needs a server merge -> lazy server fallback
 }
