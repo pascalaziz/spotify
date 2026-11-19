@@ -1465,8 +1465,12 @@ final class AxDownloads: NSObject {
                              "got": Int(t.countOfBytesReceived),
                              "total": max(0, Int(t.countOfBytesExpectedToReceive)),
                              "speed": Int(self.speedState[k]?.ema ?? 0),
-                             "state": t.state.rawValue])
+                             "state": t.state.rawValue,
+                             "via": AxBatch.shared.viaFor(k)])
             }
+            /* Accelerated jobs live in a SEPARATE session, so getAllTasks above cannot see them:
+               fold their aggregate progress in here too, or the panel's sync channel misses them. */
+            rows.append(contentsOf: AxAccelerator.shared.snapshot())
             DispatchQueue.main.async { self.emitRows(rows) }
         }
     }
@@ -1719,6 +1723,18 @@ final class AxAccelerator: NSObject, URLSessionDownloadDelegate {
 
     func isActive(_ key: String) -> Bool { q.sync { jobs[key] != nil } }
 
+    /* Aggregate live progress of active accelerated jobs, shaped like the background sync rows so
+       AxDownloads.syncToPage can fold them into the same channel (key/got/total/speed/via). */
+    func snapshot() -> [[String: Any]] {
+        return q.sync {
+            jobs.values.filter { !$0.closed }.map { job in
+                let got = job.received.reduce(0, +)
+                return ["type": "progress", "key": job.key, "got": Int(got), "total": Int(job.total),
+                        "speed": Int(speed[job.key]?.ema ?? 0), "state": 1, "via": "device"]
+            }
+        }
+    }
+
     func attempt(key: String, url: URL, title: String,
                  onProgress: @escaping (String, Int, Int, Int) -> Void,
                  onComplete: @escaping (String, URL, Int) -> Void,
@@ -1870,6 +1886,7 @@ final class AxBatch {
         var res: String?
         var via: String?            // device | server (which side produced the bytes)
         var speed: Int?             // live bytes/sec from the native engine (EMA)
+        var phase: String?          // "Resolving on device" | "Downloading" — clear live state
     }
 
     private var items: [Item] = []
@@ -1880,6 +1897,8 @@ final class AxBatch {
     private var batchScript = ""   // capture user-script from the website (?v= updatable, no reinstall)
     private var deviceOnly = false  // TEST: no host fallback — a failed device capture marks the item Failed
     private var lastProgEmit = Date.distantPast  // throttle live batch progress emits
+    private var preresolved: [String: String] = [:]   // key -> captured stream URL, ready before its turn
+    private var preresolving: Set<String> = []
 
     private init() {
         let nc = NotificationCenter.default
@@ -1910,7 +1929,7 @@ final class AxBatch {
         items = list.map { d in
             Item(key: d["key"] ?? "", url: d["url"] ?? "", title: d["title"] ?? "",
                  status: "queued", got: 0, total: 0,
-                 src: d["src"], fmt: d["fmt"], res: d["res"], via: nil, speed: nil)
+                 src: d["src"], fmt: d["fmt"], res: d["res"], via: nil, speed: nil, phase: nil)
         }.filter { !$0.key.isEmpty && (!$0.url.isEmpty || !($0.src ?? "").isEmpty) }
         paused = false
         stopped = false
@@ -1960,13 +1979,25 @@ final class AxBatch {
            capture -> lazy server rip (only then does the host work). The batch starts immediately
            instead of blocking on N upfront resolves that time out against the resolver's slots. */
         if let vid = axVideoIdSwift(src) {   // resolver falls back to the baked-in script when batchScript is empty
+            /* INSTANT START: a pre-resolve already captured this item while the previous one downloaded,
+               so its turn begins with zero resolve wait (the "stuck on Starting" fix). */
+            if let cached = preresolved[key], let u = URL(string: cached) {
+                preresolved.removeValue(forKey: key)
+                items[idx].url = cached; items[idx].via = "device"; items[idx].phase = "Downloading"
+                save(); emit()
+                AxDownloads.shared.start(key: key, url: u, title: title, waitReady: false)
+                preresolveNext()
+                return
+            }
+            items[idx].phase = "Resolving on device"; save(); emit()
             AxResolveCenter.shared.resolve(id: vid, script: batchScript, fmt: fmt) { [weak self] urls in
                 guard let self = self else { return }
                 guard idx < self.items.count, self.items[idx].key == key, self.items[idx].status == "running" else { return }
                 if let picked = axPickStreamSwift(urls, fmt: fmt, res: res), let u = URL(string: picked) {
-                    self.items[idx].url = picked; self.items[idx].via = "device"
+                    self.items[idx].url = picked; self.items[idx].via = "device"; self.items[idx].phase = "Downloading"
                     self.save(); self.emit()
                     AxDownloads.shared.start(key: key, url: u, title: title, waitReady: false)
+                    self.preresolveNext()
                 } else {
                     if self.deviceOnly { self.items[idx].via = "device"; self.save(); self.emit(); self.markFailed(key: key) }
                     else { self.serverFallback(idx: idx, key: key, title: title, src: src, fmt: fmt, res: res, fallback: fallback) }
@@ -2023,6 +2054,33 @@ final class AxBatch {
 
     /* Live progress straight from the native engine (didWriteData). The batch emitter now carries
        got/total/speed itself, so the panel never depends on a second channel matching the row. */
+    /* Capture the NEXT queued item's stream while the current one downloads, so the chain never
+       waits on a resolve between files. Uses the resolver's existing parallel slots; cached URL is
+       consumed by pump on that item's turn. Cancelled/changed items are discarded by the guards. */
+    private func preresolveNext() {
+        guard !paused, !stopped else { return }
+        guard let idx = items.firstIndex(where: { $0.status == "queued" }) else { return }
+        let key = items[idx].key
+        guard preresolved[key] == nil, !preresolving.contains(key) else { return }
+        let src = items[idx].src ?? "", fmt = items[idx].fmt ?? "mp3", res = items[idx].res ?? "best"
+        guard let vid = axVideoIdSwift(src) else { return }
+        preresolving.insert(key)
+        AxResolveCenter.shared.resolve(id: vid, script: batchScript, fmt: fmt) { [weak self] urls in
+            guard let self = self else { return }
+            self.preresolving.remove(key)
+            guard idx < self.items.count, self.items[idx].key == key, self.items[idx].status == "queued" else { return }
+            if let picked = axPickStreamSwift(urls, fmt: fmt, res: res) {
+                self.preresolved[key] = picked
+                self.pump()
+            }
+        }
+    }
+
+    /* Which side produced a key's bytes (for the sync channel's badge). Empty for non-batch keys. */
+    func viaFor(_ key: String) -> String {
+        return items.first(where: { $0.key == key })?.via ?? ""
+    }
+
     func noteProgress(key: String, got: Int, total: Int, speed: Int) {
         guard let idx = items.firstIndex(where: { $0.key == key }) else { return }
         if items[idx].status == "done" || items[idx].status == "failed" || items[idx].status == "cancelled" { return }
@@ -2030,6 +2088,7 @@ final class AxBatch {
         if total > 0 { items[idx].total = total }
         items[idx].speed = speed
         if items[idx].status == "queued" { items[idx].status = "running" }
+        if got > 0 { items[idx].phase = "Downloading" }
         let now = Date()
         if now.timeIntervalSince(lastProgEmit) >= 0.7 {
             lastProgEmit = now
@@ -2073,7 +2132,7 @@ final class AxBatch {
             let pct = i.total > 0 ? Int(Double(i.got) / Double(i.total) * 100) : 0
             return "{\"key\":\"" + AxBatch.esc(i.key) + "\",\"status\":\"" + AxBatch.esc(i.status)
                  + "\",\"got\":" + String(i.got) + ",\"total\":" + String(i.total)
-                 + ",\"pct\":" + String(pct) + ",\"speed\":" + String(i.speed ?? 0) + ",\"via\":\"" + AxBatch.esc(i.via ?? "") + "\",\"title\":\"" + AxBatch.esc(i.title) + "\"}"
+                 + ",\"pct\":" + String(pct) + ",\"speed\":" + String(i.speed ?? 0) + ",\"phase\":\"" + AxBatch.esc(i.phase ?? "") + "\",\"via\":\"" + AxBatch.esc(i.via ?? "") + "\",\"title\":\"" + AxBatch.esc(i.title) + "\"}"
         }
         let json = "{type:'batch',name:'" + AxBatch.esc(batchName) + "',done:" + String(done)
                  + ",total:" + String(items.count) + ",paused:" + (paused ? "true" : "false")
