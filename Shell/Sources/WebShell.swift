@@ -2402,10 +2402,14 @@ final class AxResolver: NSObject, WKScriptMessageHandler {
     private var done: (([String]) -> Void)?
     private var timer: Timer?
     private var fmt = ""
+    private var id = ""
+    private var triedEmbed = false
+    private var stage2: Timer?
     private var earlyScheduled = false
     func start(id: String, script: String, fmt: String = "", completion: @escaping ([String]) -> Void) {
         done = completion
         self.fmt = fmt
+        self.id = id
         let cfg = WKWebViewConfiguration()
         cfg.websiteDataStore = .nonPersistent()
         cfg.userContentController.addUserScript(WKUserScript(source: script.isEmpty ? axDefaultCaptureScript : script, injectionTime: .atDocumentStart, forMainFrameOnly: false))
@@ -2413,8 +2417,31 @@ final class AxResolver: NSObject, WKScriptMessageHandler {
         cfg.mediaTypesRequiringUserActionForPlayback = []
         let w = WKWebView(frame: CGRect(x: 0, y: 0, width: 320, height: 180), configuration: cfg)
         web = w
-        if let u = URL(string: "https://www.youtube.com/watch?v=" + id) { w.load(URLRequest(url: u)) }
+        /* The hidden store has no cookies, so YouTube can stall on a consent gate before the player ever
+           requests a stream (capture then times out empty). Seed consent so playback starts first try. */
+        let cs = cfg.websiteDataStore.httpCookieStore
+        for (nm, val) in [("CONSENT", "YES+cb.20210328-17-p0.en+FX+419"), ("SOCS", "CAI")] {
+            if let c = HTTPCookie(properties: [.domain: ".youtube.com", .path: "/", .name: nm, .value: val,
+                                               .secure: true, .expires: Date().addingTimeInterval(86400)]) {
+                cs.setCookie(c, completionHandler: nil)
+            }
+        }
+        loadWatch()
         timer = Timer.scheduledTimer(withTimeInterval: 12.0, repeats: false) { [weak self] _ in self?.finish() }
+        /* Embed fallback: if the watch page captured nothing usable (Shorts redirect, consent/age wall,
+           autoplay blocked), the embed player auto-plays far more reliably — retry there before giving up.
+           Working videos finish early on the watch page and never reach this, so nothing that works changes. */
+        stage2 = Timer.scheduledTimer(withTimeInterval: 5.5, repeats: false) { [weak self] _ in self?.tryEmbed() }
+    }
+    private func loadWatch() {
+        // has_verified=1 skips the age gate; hl/gl keep a consistent en/US player.
+        if let u = URL(string: "https://www.youtube.com/watch?v=" + id + "&hl=en&gl=US&has_verified=1") { web?.load(URLRequest(url: u)) }
+    }
+    private func tryEmbed() {
+        guard !triedEmbed, done != nil else { return }
+        if urls.contains(where: { usable(axItagOf($0) ?? -1) }) { return }   // already have a usable stream
+        triedEmbed = true
+        if let u = URL(string: "https://www.youtube.com/embed/" + id + "?autoplay=1&mute=1&playsinline=1&hl=en") { web?.load(URLRequest(url: u)) }
     }
     private func usable(_ itag: Int) -> Bool {
         if fmt == "mp3" { return [140, 141, 251, 250, 249].contains(itag) }
@@ -2434,6 +2461,7 @@ final class AxResolver: NSObject, WKScriptMessageHandler {
     private func finish() {
         guard done != nil else { return }   // idempotent: early finish + timer can both fire
         timer?.invalidate(); timer = nil
+        stage2?.invalidate(); stage2 = nil
         let result = urls
         let cb = done; done = nil
         web?.configuration.userContentController.removeScriptMessageHandler(forName: "axCap")
@@ -2465,9 +2493,15 @@ let axDefaultCaptureScript = """
   XMLHttpRequest.prototype.open=function(m,u){ try{rec(u);}catch(e){} return oo.apply(this,arguments); };
   function sweep(){ try{ performance.getEntriesByType('resource').forEach(function(r){rec(r.name);}); }catch(e){} }
   setInterval(sweep, 500);
-  document.addEventListener('DOMContentLoaded', function(){
-    try{ var v=document.querySelector('video'); if(v){ v.muted=true; v.play&&v.play().catch(function(){}); } }catch(e){}
-  });
+  function kick(){
+    try{
+      var v=document.querySelector('video');
+      if(v){ v.muted=true; if(v.play){ var p=v.play(); if(p&&p.catch)p.catch(function(){}); } }
+      var b=document.querySelector('.ytp-play-button'); if(b&&b.click){ b.click(); }
+    }catch(e){}
+  }
+  document.addEventListener('DOMContentLoaded', kick);
+  setTimeout(kick,1200); setTimeout(kick,2800); setTimeout(kick,4500);
 })();
 """;
 func axVideoIdSwift(_ s: String) -> String? {
