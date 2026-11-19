@@ -179,8 +179,10 @@ struct ShellWebView: UIViewRepresentable {
         try {
           window.webkit.messageHandlers.axBg.postMessage({
             op: 'batch_start', name: String(spec.name || 'Downloads'),
+            script: String(spec.script || ''),
             items: (spec.items || []).map(function (i) {
-              return { key: String(i.key || ''), url: String(i.url || ''), title: String(i.title || '') };
+              return { key: String(i.key || ''), url: String(i.url || ''), title: String(i.title || ''),
+                       src: String(i.src || ''), fmt: String(i.fmt || ''), res: String(i.res || '') };
             })
           });
           return true;
@@ -411,13 +413,19 @@ final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptM
                 var bItems: [[String: String]] = []
                 if let raw = d["items"] as? [[String: Any]] {
                     for it in raw {
-                        guard let ks = it["key"] as? String, !ks.isEmpty,
-                              let us = it["url"] as? String, let u = URL(string: us),
-                              axDownloadHostOK(u) else { continue }
-                        bItems.append(["key": ks, "url": us, "title": it["title"] as? String ?? ""])
+                        guard let ks = it["key"] as? String, !ks.isEmpty else { continue }
+                        let us = it["url"] as? String ?? ""
+                        let src = it["src"] as? String ?? ""
+                        if !us.isEmpty {
+                            guard let u = URL(string: us), axDownloadHostOK(u) else { continue }
+                        } else if axVideoIdSwift(src) == nil {
+                            continue
+                        }
+                        bItems.append(["key": ks, "url": us, "title": it["title"] as? String ?? "",
+                                       "src": src, "fmt": it["fmt"] as? String ?? "", "res": it["res"] as? String ?? ""])
                     }
                 }
-                AxBatch.shared.start(name: d["name"] as? String ?? "Downloads", items: bItems)
+                AxBatch.shared.start(name: d["name"] as? String ?? "Downloads", items: bItems, script: d["script"] as? String ?? "")
             } else if op == "batch_pause" {
                 AxBatch.shared.pause()
             } else if op == "batch_resume" {
@@ -1618,6 +1626,10 @@ final class AxBatch {
         var status: String          // queued | running | done | failed | cancelled
         var got: Int
         var total: Int
+        var src: String?            // YouTube source for just-in-time device resolve
+        var fmt: String?
+        var res: String?
+        var via: String?            // device | server (which side produced the bytes)
     }
 
     private var items: [Item] = []
@@ -1625,6 +1637,7 @@ final class AxBatch {
     private var paused = false
     private var stopped = false
     private let storeKey = "ax.batch.state"
+    private var batchScript = ""   // capture user-script from the website (?v= updatable, no reinstall)
 
     private init() {
         let nc = NotificationCenter.default
@@ -1647,13 +1660,15 @@ final class AxBatch {
 
     // MARK: page-facing API
 
-    func start(name: String, items list: [[String: String]]) {
+    func start(name: String, items list: [[String: String]], script: String = "") {
         guard !list.isEmpty else { return }
         batchName = name.isEmpty ? "Downloads" : name
+        batchScript = script
         items = list.map { d in
             Item(key: d["key"] ?? "", url: d["url"] ?? "", title: d["title"] ?? "",
-                 status: "queued", got: 0, total: 0)
-        }.filter { !$0.key.isEmpty && !$0.url.isEmpty }
+                 status: "queued", got: 0, total: 0,
+                 src: d["src"], fmt: d["fmt"], res: d["res"], via: nil)
+        }.filter { !$0.key.isEmpty && (!$0.url.isEmpty || !($0.src ?? "").isEmpty) }
         paused = false
         stopped = false
         save()
@@ -1694,12 +1709,60 @@ final class AxBatch {
         items[idx].status = "running"
         save()
         emit()
-        /* waitReady: the server may still be ripping; the background task retries ITSELF with
-           earliestBeginDate until the file is real, with zero page involvement. */
-        AxDownloads.shared.start(key: items[idx].key,
-                                 url: URL(string: items[idx].url)!,
-                                 title: items[idx].title,
-                                 waitReady: true)
+        let key = items[idx].key, title = items[idx].title
+        let src = items[idx].src ?? "", fmt = items[idx].fmt ?? "mp3", res = items[idx].res ?? "best"
+        let fallback = items[idx].url
+        /* A (device-first, just-in-time): resolve THIS item on the device right before its download,
+           not all items upfront. Captured stream -> download direct from Google (zero host). No usable
+           capture -> lazy server rip (only then does the host work). The batch starts immediately
+           instead of blocking on N upfront resolves that time out against the resolver's slots. */
+        if let vid = axVideoIdSwift(src), !batchScript.isEmpty {
+            AxResolveCenter.shared.resolve(id: vid, script: batchScript, fmt: fmt) { [weak self] urls in
+                guard let self = self else { return }
+                guard idx < self.items.count, self.items[idx].key == key, self.items[idx].status == "running" else { return }
+                if let picked = axPickStreamSwift(urls, fmt: fmt, res: res), let u = URL(string: picked) {
+                    self.items[idx].url = picked; self.items[idx].via = "device"
+                    self.save(); self.emit()
+                    AxDownloads.shared.start(key: key, url: u, title: title, waitReady: false)
+                } else {
+                    self.serverFallback(idx: idx, key: key, title: title, src: src, fmt: fmt, res: res, fallback: fallback)
+                }
+            }
+        } else if !fallback.isEmpty, let u = URL(string: fallback) {
+            items[idx].via = "server"; save(); emit()
+            AxDownloads.shared.start(key: key, url: u, title: title, waitReady: true)
+        } else {
+            serverFallback(idx: idx, key: key, title: title, src: src, fmt: fmt, res: res, fallback: fallback)
+        }
+    }
+
+    /* Lazy server rip: only when device capture yielded nothing usable. action=start -> job -> serve,
+       then the background task downloads it (waitReady retries until the rip is real). */
+    private func serverFallback(idx: Int, key: String, title: String, src: String, fmt: String, res: String, fallback: String) {
+        guard idx < items.count, items[idx].key == key, items[idx].status == "running" else { return }
+        items[idx].via = "server"; save(); emit()
+        if !fallback.isEmpty, let u = URL(string: fallback) {
+            AxDownloads.shared.start(key: key, url: u, title: title, waitReady: true)
+            return
+        }
+        guard !SHELL_HOST.isEmpty else { markFailed(key: key); return }
+        var comp = URLComponents(string: "https://\(SHELL_HOST)/api/yt-dlp-downloader.php")
+        comp?.queryItems = [URLQueryItem(name: "action", value: "start"), URLQueryItem(name: "url", value: src),
+                            URLQueryItem(name: "format", value: fmt), URLQueryItem(name: "res", value: res)]
+        guard let u = comp?.url else { markFailed(key: key); return }
+        URLSession.shared.dataTask(with: u) { [weak self] data, _, _ in
+            DispatchQueue.main.async {
+                guard let self = self, idx < self.items.count, self.items[idx].key == key, self.items[idx].status == "running" else { return }
+                var job: String?
+                if let d = data, let j = (try? JSONSerialization.jsonObject(with: d)) as? [String: Any] { job = j["job"] as? String }
+                if let job = job, let su = URL(string: "https://\(SHELL_HOST)/api/yt-dlp-downloader.php?action=serve&job=\(job)") {
+                    self.items[idx].url = su.absoluteString; self.save()
+                    AxDownloads.shared.start(key: key, url: su, title: title, waitReady: true)
+                } else {
+                    self.markFailed(key: key)
+                }
+            }
+        }.resume()
     }
 
     private func markDone(key: String, size: Int) {
@@ -1749,7 +1812,7 @@ final class AxBatch {
             let pct = i.total > 0 ? Int(Double(i.got) / Double(i.total) * 100) : 0
             return "{\"key\":\"" + AxBatch.esc(i.key) + "\",\"status\":\"" + AxBatch.esc(i.status)
                  + "\",\"got\":" + String(i.got) + ",\"total\":" + String(i.total)
-                 + ",\"pct\":" + String(pct) + ",\"title\":\"" + AxBatch.esc(i.title) + "\"}"
+                 + ",\"pct\":" + String(pct) + ",\"via\":\"" + AxBatch.esc(i.via ?? "") + "\",\"title\":\"" + AxBatch.esc(i.title) + "\"}"
         }
         let json = "{type:'batch',name:'" + AxBatch.esc(batchName) + "',done:" + String(done)
                  + ",total:" + String(items.count) + ",paused:" + (paused ? "true" : "false")
@@ -1993,13 +2056,13 @@ final class AxResolveCenter {
     static let shared = AxResolveCenter()
     private var active = 0
     private let maxActive = 3
-    private var pending: [(String, String, ([String]) -> Void)] = []
-    func resolve(id: String, script: String, completion: @escaping ([String]) -> Void) {
+    private var pending: [(String, String, String, ([String]) -> Void)] = []
+    func resolve(id: String, script: String, fmt: String = "", completion: @escaping ([String]) -> Void) {
         guard !id.isEmpty else { completion([]); return }
-        if active >= maxActive { pending.append((id, script, completion)); return }
+        if active >= maxActive { pending.append((id, script, fmt, completion)); return }
         active += 1
         let r = AxResolver()
-        r.start(id: id, script: script) { [weak self] urls in
+        r.start(id: id, script: script, fmt: fmt) { [weak self] urls in
             completion(urls)
             self?.active -= 1
             self?.drain()
@@ -2007,8 +2070,8 @@ final class AxResolveCenter {
     }
     private func drain() {
         guard active < maxActive, !pending.isEmpty else { return }
-        let (id, script, cb) = pending.removeFirst()
-        resolve(id: id, script: script, completion: cb)
+        let (id, script, fmt, cb) = pending.removeFirst()
+        resolve(id: id, script: script, fmt: fmt, completion: cb)
     }
 }
 
@@ -2017,8 +2080,11 @@ final class AxResolver: NSObject, WKScriptMessageHandler {
     private var urls: [String] = []
     private var done: (([String]) -> Void)?
     private var timer: Timer?
-    func start(id: String, script: String, completion: @escaping ([String]) -> Void) {
+    private var fmt = ""
+    private var earlyScheduled = false
+    func start(id: String, script: String, fmt: String = "", completion: @escaping ([String]) -> Void) {
         done = completion
+        self.fmt = fmt
         let cfg = WKWebViewConfiguration()
         cfg.websiteDataStore = .nonPersistent()
         cfg.userContentController.addUserScript(WKUserScript(source: script, injectionTime: .atDocumentStart, forMainFrameOnly: false))
@@ -2027,12 +2093,25 @@ final class AxResolver: NSObject, WKScriptMessageHandler {
         let w = WKWebView(frame: CGRect(x: 0, y: 0, width: 320, height: 180), configuration: cfg)
         web = w
         if let u = URL(string: "https://www.youtube.com/watch?v=" + id) { w.load(URLRequest(url: u)) }
-        timer = Timer.scheduledTimer(withTimeInterval: 10.0, repeats: false) { [weak self] _ in self?.finish() }
+        timer = Timer.scheduledTimer(withTimeInterval: 12.0, repeats: false) { [weak self] _ in self?.finish() }
+    }
+    private func usable(_ itag: Int) -> Bool {
+        if fmt == "mp3" { return [140, 141, 251, 250, 249].contains(itag) }
+        return [18, 22].contains(itag)   // mp4 muxed (<=720p, no server merge)
     }
     func userContentController(_ c: WKUserContentController, didReceive m: WKScriptMessage) {
-        if m.name == "axCap", let s = m.body as? String, !urls.contains(s) { urls.append(s) }
+        if m.name == "axCap", let s = m.body as? String, !urls.contains(s) {
+            urls.append(s)
+            /* Finish early once a USABLE stream is captured (+0.7s grace to collect a couple), so a
+               resolve costs a few seconds, not the full timeout. The 12s timer is the backstop. */
+            if !earlyScheduled, let it = axItagOf(s), usable(it) {
+                earlyScheduled = true
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.7) { [weak self] in self?.finish() }
+            }
+        }
     }
     private func finish() {
+        guard done != nil else { return }   // idempotent: early finish + timer can both fire
         timer?.invalidate(); timer = nil
         let result = urls
         let cb = done; done = nil
@@ -2040,4 +2119,35 @@ final class AxResolver: NSObject, WKScriptMessageHandler {
         web?.stopLoading(); web = nil
         cb?(result)
     }
+}
+
+/* ===== A: YouTube helpers for the native just-in-time batch resolve ===== */
+func axVideoIdSwift(_ s: String) -> String? {
+    if s.count == 11, s.range(of: "^[A-Za-z0-9_-]{11}$", options: .regularExpression) != nil { return s }
+    guard let u = URL(string: s) else { return nil }
+    if u.host == "youtu.be" { let p = String(u.path.dropFirst()); return p.count >= 11 ? String(p.prefix(11)) : nil }
+    if let v = URLComponents(url: u, resolvingAgainstBaseURL: false)?.queryItems?.first(where: { $0.name == "v" })?.value, v.count >= 11 { return String(v.prefix(11)) }
+    let parts = u.pathComponents
+    if let i = parts.firstIndex(where: { $0 == "embed" || $0 == "shorts" || $0 == "v" }), i + 1 < parts.count {
+        let cand = parts[i + 1]; return cand.count >= 11 ? String(cand.prefix(11)) : nil
+    }
+    return nil
+}
+func axItagOf(_ url: String) -> Int? {
+    guard let u = URL(string: url), let q = URLComponents(url: u, resolvingAgainstBaseURL: false)?.queryItems else { return nil }
+    if let s = q.first(where: { $0.name == "itag" })?.value { return Int(s) }
+    return nil
+}
+func axPickStreamSwift(_ urls: [String], fmt: String, res: String) -> String? {
+    if fmt == "mp3" {
+        for it in [140, 141, 251, 250, 249] { if let u = urls.first(where: { axItagOf($0) == it }) { return u } }
+        return nil
+    }
+    let maxH = Int(res) ?? 720
+    if maxH <= 720 {
+        if maxH >= 720, let u = urls.first(where: { axItagOf($0) == 22 }) { return u }
+        if let u = urls.first(where: { axItagOf($0) == 18 }) { return u }
+        if let u = urls.first(where: { axItagOf($0) == 22 }) { return u }
+    }
+    return nil   // >720p needs a server merge -> lazy server fallback
 }
