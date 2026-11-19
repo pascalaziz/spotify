@@ -1543,6 +1543,7 @@ extension AxDownloads: URLSessionDownloadDelegate, URLSessionDataDelegate {
                 self.speedState[key] = (totalBytesWritten, now, 0)
             }
             let sp = Int(speed)
+            AxBatch.shared.noteProgress(key: key, got: Int(totalBytesWritten), total: Int(max(0, totalBytesExpectedToWrite)), speed: sp)
             AxActivity.shared.ensure(title: t)
             AxActivity.shared.update(title: t, pct: pct, got: Int(totalBytesWritten), total: Int(max(0, totalBytesExpectedToWrite)), status: "Downloading")
             AxNotify.shared.progress(key: key,
@@ -1649,6 +1650,7 @@ final class AxBatch {
         var fmt: String?
         var res: String?
         var via: String?            // device | server (which side produced the bytes)
+        var speed: Int?             // live bytes/sec from the native engine (EMA)
     }
 
     private var items: [Item] = []
@@ -1658,6 +1660,7 @@ final class AxBatch {
     private let storeKey = "ax.batch.state"
     private var batchScript = ""   // capture user-script from the website (?v= updatable, no reinstall)
     private var deviceOnly = false  // TEST: no host fallback — a failed device capture marks the item Failed
+    private var lastProgEmit = Date.distantPast  // throttle live batch progress emits
 
     private init() {
         let nc = NotificationCenter.default
@@ -1688,7 +1691,7 @@ final class AxBatch {
         items = list.map { d in
             Item(key: d["key"] ?? "", url: d["url"] ?? "", title: d["title"] ?? "",
                  status: "queued", got: 0, total: 0,
-                 src: d["src"], fmt: d["fmt"], res: d["res"], via: nil)
+                 src: d["src"], fmt: d["fmt"], res: d["res"], via: nil, speed: nil)
         }.filter { !$0.key.isEmpty && (!$0.url.isEmpty || !($0.src ?? "").isEmpty) }
         paused = false
         stopped = false
@@ -1799,6 +1802,22 @@ final class AxBatch {
         pump()                                             // next file, immediately
     }
 
+    /* Live progress straight from the native engine (didWriteData). The batch emitter now carries
+       got/total/speed itself, so the panel never depends on a second channel matching the row. */
+    func noteProgress(key: String, got: Int, total: Int, speed: Int) {
+        guard let idx = items.firstIndex(where: { $0.key == key }) else { return }
+        if items[idx].status == "done" || items[idx].status == "failed" || items[idx].status == "cancelled" { return }
+        if got > items[idx].got { items[idx].got = got }
+        if total > 0 { items[idx].total = total }
+        items[idx].speed = speed
+        if items[idx].status == "queued" { items[idx].status = "running" }
+        let now = Date()
+        if now.timeIntervalSince(lastProgEmit) >= 0.7 {
+            lastProgEmit = now
+            emit()
+        }
+    }
+
     private func markFailed(key: String) {
         guard let idx = items.firstIndex(where: { $0.key == key }) else { return }
         if items[idx].status == "done" { return }
@@ -1835,7 +1854,7 @@ final class AxBatch {
             let pct = i.total > 0 ? Int(Double(i.got) / Double(i.total) * 100) : 0
             return "{\"key\":\"" + AxBatch.esc(i.key) + "\",\"status\":\"" + AxBatch.esc(i.status)
                  + "\",\"got\":" + String(i.got) + ",\"total\":" + String(i.total)
-                 + ",\"pct\":" + String(pct) + ",\"via\":\"" + AxBatch.esc(i.via ?? "") + "\",\"title\":\"" + AxBatch.esc(i.title) + "\"}"
+                 + ",\"pct\":" + String(pct) + ",\"speed\":" + String(i.speed ?? 0) + ",\"via\":\"" + AxBatch.esc(i.via ?? "") + "\",\"title\":\"" + AxBatch.esc(i.title) + "\"}"
         }
         let json = "{type:'batch',name:'" + AxBatch.esc(batchName) + "',done:" + String(done)
                  + ",total:" + String(items.count) + ",paused:" + (paused ? "true" : "false")
