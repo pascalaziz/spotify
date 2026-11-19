@@ -1181,6 +1181,8 @@ final class AxDownloads: NSObject {
     /* key -> meta, persisted: a relaunch that happens ONLY to deliver session events still needs
        the title/url to finish the bookkeeping correctly. */
     private var meta: [String: [String: String]] = [:]
+    /* A: live download speed (bytes/sec), EMA-smoothed per key from real URLSession byte callbacks. */
+    private var speedState: [String: (last: Int64, time: Date, ema: Double)] = [:]
     private var pending: [String: String] = [:]
     /* WAIT-READY RETRIES: backgrounding during the server rip phase hands a serve URL whose job
        is not final yet; the serve answers 404 JSON. The engine used to save that JSON AS the
@@ -1399,6 +1401,7 @@ final class AxDownloads: NSObject {
                              "key": k,
                              "got": Int(t.countOfBytesReceived),
                              "total": max(0, Int(t.countOfBytesExpectedToReceive)),
+                             "speed": Int(self.speedState[k]?.ema ?? 0),
                              "state": t.state.rawValue])
             }
             DispatchQueue.main.async { self.emitRows(rows) }
@@ -1424,8 +1427,8 @@ final class AxDownloads: NSObject {
         NativePlayer.shared.bgLibURL(k)
     }
 
-    private func emit(key: String, type: String, got: Int, total: Int, msg: String) {
-        let js = "window.dispatchEvent(new CustomEvent('axbg',{detail:{type:\(Self.json(type)),key:\(Self.json(key)),got:\(got),total:\(total),msg:\(Self.json(msg))}}))"
+    private func emit(key: String, type: String, got: Int, total: Int, msg: String, speed: Int = 0) {
+        let js = "window.dispatchEvent(new CustomEvent('axbg',{detail:{type:\(Self.json(type)),key:\(Self.json(key)),got:\(got),total:\(total),speed:\(speed),msg:\(Self.json(msg))}}))"
         web?.evaluateJavaScript(js, completionHandler: nil)
     }
 
@@ -1507,6 +1510,7 @@ extension AxDownloads: URLSessionDownloadDelegate, URLSessionDataDelegate {
         DispatchQueue.main.async {
             let t = self.meta[key]?["title"] ?? ""
             self.clearMeta(key)
+            self.speedState.removeValue(forKey: key)
             AxNotify.shared.completed(key: key, title: t.isEmpty ? key : t)
             AxActivity.shared.end(status: "Complete")
             self.emit(key: key, type: "done", got: size, total: size, msg: "")
@@ -1525,6 +1529,20 @@ extension AxDownloads: URLSessionDownloadDelegate, URLSessionDataDelegate {
         DispatchQueue.main.async {
             let t = self.meta[key]?["title"] ?? key
             let pct = totalBytesExpectedToWrite > 0 ? Double(Double(totalBytesWritten) / Double(totalBytesExpectedToWrite) * 100) : 0
+            /* A: bytes/sec from the real write delta, EMA-smoothed so the readout is steady. */
+            let now = Date()
+            var speed = 0.0
+            if let st = self.speedState[key] {
+                let dt = now.timeIntervalSince(st.time)
+                if dt >= 0.25 {
+                    let inst = Double(max(0, totalBytesWritten - st.last)) / dt
+                    speed = st.ema > 0 ? (0.3 * inst + 0.7 * st.ema) : inst
+                    self.speedState[key] = (totalBytesWritten, now, speed)
+                } else { speed = st.ema }
+            } else {
+                self.speedState[key] = (totalBytesWritten, now, 0)
+            }
+            let sp = Int(speed)
             AxActivity.shared.ensure(title: t)
             AxActivity.shared.update(title: t, pct: pct, got: Int(totalBytesWritten), total: Int(max(0, totalBytesExpectedToWrite)), status: "Downloading")
             AxNotify.shared.progress(key: key,
@@ -1532,11 +1550,12 @@ extension AxDownloads: URLSessionDownloadDelegate, URLSessionDataDelegate {
                                      pct: Int(pct),
                                      got: Int(totalBytesWritten),
                                      total: Int(max(0, totalBytesExpectedToWrite)),
-                                     phase: "Downloading")
+                                     phase: "Downloading",
+                                     speed: sp)
             if UIApplication.shared.applicationState == .active {
                 self.emit(key: key, type: "progress",
                           got: Int(totalBytesWritten),
-                          total: Int(max(0, totalBytesExpectedToWrite)), msg: "")
+                          total: Int(max(0, totalBytesExpectedToWrite)), msg: "", speed: sp)
             }
         }
     }
@@ -1975,7 +1994,7 @@ final class AxNotify: NSObject {
 
     /* One notification per download key, updated in place. Throttled to >= 1.2 s per key.
        Posted only while backgrounded - in the foreground the in-app panel is the surface. */
-    func progress(key: String, title: String, pct: Int, got: Int, total: Int, phase: String) {
+    func progress(key: String, title: String, pct: Int, got: Int, total: Int, phase: String, speed: Int = 0) {
         guard allowed, !key.isEmpty, !title.isEmpty else { return }
         guard UIApplication.shared.applicationState != .active else { return }
         let now = Date()
@@ -1983,6 +2002,7 @@ final class AxNotify: NSObject {
         lastProgress[key] = now
         var body = pct > 0 ? "\(pct)% · " : ""
         if total > 0 { body += "\(Self.humanSize(got)) / \(Self.humanSize(total))" }
+        if speed > 0 { body += (body.isEmpty ? "" : " · ") + "\(Self.humanSize(speed))/s" }
         if !phase.isEmpty && phase != "Downloading" && phase != "Paused" { body = phase + (body.isEmpty ? "" : " · " + body) }
         let c = content(title: title, body: body.isEmpty ? "Downloading…" : body)
         let req = UNNotificationRequest(identifier: "ax.dl." + key, content: c, trigger: nil)
