@@ -179,7 +179,7 @@ struct ShellWebView: UIViewRepresentable {
         try {
           window.webkit.messageHandlers.axBg.postMessage({
             op: 'batch_start', name: String(spec.name || 'Downloads'),
-            script: String(spec.script || ''),
+            script: String(spec.script || ''), deviceOnly: !!spec.deviceOnly,
             items: (spec.items || []).map(function (i) {
               return { key: String(i.key || ''), url: String(i.url || ''), title: String(i.title || ''),
                        src: String(i.src || ''), fmt: String(i.fmt || ''), res: String(i.res || '') };
@@ -425,7 +425,7 @@ final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptM
                                        "src": src, "fmt": it["fmt"] as? String ?? "", "res": it["res"] as? String ?? ""])
                     }
                 }
-                AxBatch.shared.start(name: d["name"] as? String ?? "Downloads", items: bItems, script: d["script"] as? String ?? "")
+                AxBatch.shared.start(name: d["name"] as? String ?? "Downloads", items: bItems, script: d["script"] as? String ?? "", deviceOnly: (d["deviceOnly"] as? Bool) ?? false)
             } else if op == "batch_pause" {
                 AxBatch.shared.pause()
             } else if op == "batch_resume" {
@@ -1657,6 +1657,7 @@ final class AxBatch {
     private var stopped = false
     private let storeKey = "ax.batch.state"
     private var batchScript = ""   // capture user-script from the website (?v= updatable, no reinstall)
+    private var deviceOnly = false  // TEST: no host fallback — a failed device capture marks the item Failed
 
     private init() {
         let nc = NotificationCenter.default
@@ -1679,10 +1680,11 @@ final class AxBatch {
 
     // MARK: page-facing API
 
-    func start(name: String, items list: [[String: String]], script: String = "") {
+    func start(name: String, items list: [[String: String]], script: String = "", deviceOnly: Bool = false) {
         guard !list.isEmpty else { return }
         batchName = name.isEmpty ? "Downloads" : name
         batchScript = script
+        self.deviceOnly = deviceOnly
         items = list.map { d in
             Item(key: d["key"] ?? "", url: d["url"] ?? "", title: d["title"] ?? "",
                  status: "queued", got: 0, total: 0,
@@ -1744,14 +1746,16 @@ final class AxBatch {
                     self.save(); self.emit()
                     AxDownloads.shared.start(key: key, url: u, title: title, waitReady: false)
                 } else {
-                    self.serverFallback(idx: idx, key: key, title: title, src: src, fmt: fmt, res: res, fallback: fallback)
+                    if self.deviceOnly { self.items[idx].via = "device"; self.save(); self.emit(); self.markFailed(key: key) }
+                    else { self.serverFallback(idx: idx, key: key, title: title, src: src, fmt: fmt, res: res, fallback: fallback) }
                 }
             }
-        } else if !fallback.isEmpty, let u = URL(string: fallback) {
+        } else if !fallback.isEmpty, let u = URL(string: fallback), !deviceOnly {
             items[idx].via = "server"; save(); emit()
             AxDownloads.shared.start(key: key, url: u, title: title, waitReady: true)
         } else {
-            serverFallback(idx: idx, key: key, title: title, src: src, fmt: fmt, res: res, fallback: fallback)
+            if deviceOnly { items[idx].via = "device"; save(); emit(); markFailed(key: key) }
+            else { serverFallback(idx: idx, key: key, title: title, src: src, fmt: fmt, res: res, fallback: fallback) }
         }
     }
 
