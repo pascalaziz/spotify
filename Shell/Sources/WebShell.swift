@@ -1999,7 +1999,12 @@ final class AxBatch {
                     AxDownloads.shared.start(key: key, url: u, title: title, waitReady: false)
                     self.preresolveNext()
                 } else {
-                    if self.deviceOnly { self.items[idx].via = "device"; self.save(); self.emit(); self.markFailed(key: key) }
+                    /* A SINGLE pick must always complete — it was server-backed before and some sources
+                       (e.g. Shorts, whose web/embed player exposes no usable stream) can only be ripped by
+                       the host's android client + ffmpeg. So one item falls back to the server even in
+                       device-only mode; device-only strictness (no host) applies to BULK batches, the test
+                       scenario. Normal videos still capture device-direct (zero host, speed + badge). */
+                    if self.deviceOnly && self.items.count > 1 { self.items[idx].via = "device"; self.save(); self.emit(); self.markFailed(key: key) }
                     else { self.serverFallback(idx: idx, key: key, title: title, src: src, fmt: fmt, res: res, fallback: fallback) }
                 }
             }
@@ -2007,7 +2012,7 @@ final class AxBatch {
             items[idx].via = "server"; save(); emit()
             AxDownloads.shared.start(key: key, url: u, title: title, waitReady: true)
         } else {
-            if deviceOnly { items[idx].via = "device"; save(); emit(); markFailed(key: key) }
+            if deviceOnly && items.count > 1 { items[idx].via = "device"; save(); emit(); markFailed(key: key) }
             else { serverFallback(idx: idx, key: key, title: title, src: src, fmt: fmt, res: res, fallback: fallback) }
         }
     }
