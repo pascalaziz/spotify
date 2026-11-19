@@ -1207,6 +1207,7 @@ final class AxDownloads: NSObject {
         let cfg = URLSessionConfiguration.background(withIdentifier: Self.sessionID)
         cfg.isDiscretionary = false                 // download now, not "when the system feels like it"
         cfg.sessionSendsLaunchEvents = true
+        cfg.httpShouldSetCookies = true
         cfg.waitsForConnectivity = true             // flaky home Wi-Fi: wait instead of erroring
         cfg.timeoutIntervalForRequest = 15 * 60
         cfg.timeoutIntervalForResource = 6 * 60 * 60
@@ -1251,7 +1252,31 @@ final class AxDownloads: NSObject {
         }
     }
 
-    func attachWeb(_ w: WKWebView?) { web = w }
+    func attachWeb(_ w: WKWebView?) { web = w; Self.syncHostCookies() }
+
+    /* The host rip/serve endpoint FAILS CLOSED without the Laravel session cookie. That cookie lives in
+       the WebView's persistent store, NOT in the native URLSession jar — so native host requests (the
+       device-capture fallback for Shorts, and the serve download) used to 401. Copy the shell-host cookies
+       across so they authenticate. googlevideo.com downloads are a different host and stay untouched. */
+    static func syncHostCookies(_ completion: (() -> Void)? = nil) {
+        guard !SHELL_HOST.isEmpty else { DispatchQueue.main.async { completion?() }; return }
+        WKWebsiteDataStore.default().httpCookieStore.getAllCookies { cookies in
+            for c in cookies {
+                let d = c.domain.lowercased()
+                let h = d.hasPrefix(".") ? String(d.dropFirst()) : d
+                if h == SHELL_HOST || h.hasSuffix("." + SHELL_HOST) || SHELL_HOST.hasSuffix("." + h) {
+                    HTTPCookieStorage.shared.setCookie(c)
+                }
+            }
+            DispatchQueue.main.async { completion?() }
+        }
+    }
+    static func attachHostCookie(_ req: inout URLRequest) {
+        guard let u = req.url, let host = u.host?.lowercased(),
+              host == SHELL_HOST || host.hasSuffix("." + SHELL_HOST) else { return }
+        let cs = HTTPCookieStorage.shared.cookies(for: u) ?? []
+        if !cs.isEmpty { req.setValue(cs.map { "\($0.name)=\($0.value)" }.joined(separator: "; "), forHTTPHeaderField: "Cookie") }
+    }
 
     /* Used by AxBatch: one 'batch' event carries the whole queue state. */
     func emitBatch(_ json: String) { emitRaw(json) }
@@ -1396,6 +1421,7 @@ final class AxDownloads: NSObject {
                        instead of hitting "file not ready" (a full serve deletes the dir). */
                     var req = URLRequest(url: url)
                     req.setValue("bytes=0-", forHTTPHeaderField: "Range")
+                    Self.attachHostCookie(&req)
                     let t = self.session.downloadTask(with: req)
                     t.taskDescription = key
                     /* WAIT-READY: iOS re-runs this task natively at the earliest date WITHOUT
@@ -1935,6 +1961,7 @@ final class AxBatch {
         stopped = false
         save()
         emit()
+        AxDownloads.syncHostCookies()   // host fallback (Shorts) needs the session cookie ready
         pump()                      // first file starts NOW - no page round trip
     }
 
@@ -2031,19 +2058,23 @@ final class AxBatch {
         comp?.queryItems = [URLQueryItem(name: "action", value: "start"), URLQueryItem(name: "url", value: src),
                             URLQueryItem(name: "format", value: fmt), URLQueryItem(name: "res", value: res)]
         guard let u = comp?.url else { markFailed(key: key); return }
-        URLSession.shared.dataTask(with: u) { [weak self] data, _, _ in
-            DispatchQueue.main.async {
-                guard let self = self, idx < self.items.count, self.items[idx].key == key, self.items[idx].status == "running" else { return }
-                var job: String?
-                if let d = data, let j = (try? JSONSerialization.jsonObject(with: d)) as? [String: Any] { job = j["job"] as? String }
-                if let job = job, let su = URL(string: "https://\(SHELL_HOST)/api/yt-dlp-downloader.php?action=serve&job=\(job)") {
-                    self.items[idx].url = su.absoluteString; self.save()
-                    AxDownloads.shared.start(key: key, url: su, title: title, waitReady: true)
-                } else {
-                    self.markFailed(key: key)
+        AxDownloads.syncHostCookies {
+            var req = URLRequest(url: u)
+            AxDownloads.attachHostCookie(&req)
+            URLSession.shared.dataTask(with: req) { [weak self] data, _, _ in
+                DispatchQueue.main.async {
+                    guard let self = self, idx < self.items.count, self.items[idx].key == key, self.items[idx].status == "running" else { return }
+                    var job: String?
+                    if let d = data, let j = (try? JSONSerialization.jsonObject(with: d)) as? [String: Any] { job = j["job"] as? String }
+                    if let job = job, let su = URL(string: "https://\(SHELL_HOST)/api/yt-dlp-downloader.php?action=serve&job=\(job)") {
+                        self.items[idx].url = su.absoluteString; self.save()
+                        AxDownloads.shared.start(key: key, url: su, title: title, waitReady: true)
+                    } else {
+                        self.markFailed(key: key)
+                    }
                 }
-            }
-        }.resume()
+            }.resume()
+        }
     }
 
     private func markDone(key: String, size: Int) {
