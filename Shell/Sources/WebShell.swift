@@ -1740,7 +1740,7 @@ final class AxBatch {
            not all items upfront. Captured stream -> download direct from Google (zero host). No usable
            capture -> lazy server rip (only then does the host work). The batch starts immediately
            instead of blocking on N upfront resolves that time out against the resolver's slots. */
-        if let vid = axVideoIdSwift(src), !batchScript.isEmpty {
+        if let vid = axVideoIdSwift(src) {   // resolver falls back to the baked-in script when batchScript is empty
             AxResolveCenter.shared.resolve(id: vid, script: batchScript, fmt: fmt) { [weak self] urls in
                 guard let self = self else { return }
                 guard idx < self.items.count, self.items[idx].key == key, self.items[idx].status == "running" else { return }
@@ -2130,7 +2130,7 @@ final class AxResolver: NSObject, WKScriptMessageHandler {
         self.fmt = fmt
         let cfg = WKWebViewConfiguration()
         cfg.websiteDataStore = .nonPersistent()
-        cfg.userContentController.addUserScript(WKUserScript(source: script, injectionTime: .atDocumentStart, forMainFrameOnly: false))
+        cfg.userContentController.addUserScript(WKUserScript(source: script.isEmpty ? axDefaultCaptureScript : script, injectionTime: .atDocumentStart, forMainFrameOnly: false))
         cfg.userContentController.add(self, name: "axCap")
         cfg.mediaTypesRequiringUserActionForPlayback = []
         let w = WKWebView(frame: CGRect(x: 0, y: 0, width: 320, height: 180), configuration: cfg)
@@ -2165,6 +2165,33 @@ final class AxResolver: NSObject, WKScriptMessageHandler {
 }
 
 /* ===== A: YouTube helpers for the native just-in-time batch resolve ===== */
+/* Native fallback capture script — baked INTO the app so the device engine resolves even when the
+   website's extractor.js is unavailable (offline / cache miss / first launch). The website script
+   still wins when present (YouTube player rotations ride the ?v= deploy, no reinstall); this is the
+   safety net that makes the on-device downloader self-contained. Same logic as axCaptureUserScript. */
+let axDefaultCaptureScript = """
+(function(){
+  var seen = {};
+  function rec(u){
+    try{
+      if(typeof u!=='string' || u.indexOf('googlevideo.com')<0) return;
+      if(seen[u]) return; seen[u]=1;
+      if(window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.axCap){
+        window.webkit.messageHandlers.axCap.postMessage(u);
+      }
+    }catch(e){}
+  }
+  var of=window.fetch;
+  window.fetch=function(i){ try{rec(typeof i==='string'?i:(i&&i.url));}catch(e){} return of.apply(this,arguments); };
+  var oo=XMLHttpRequest.prototype.open;
+  XMLHttpRequest.prototype.open=function(m,u){ try{rec(u);}catch(e){} return oo.apply(this,arguments); };
+  function sweep(){ try{ performance.getEntriesByType('resource').forEach(function(r){rec(r.name);}); }catch(e){} }
+  setInterval(sweep, 500);
+  document.addEventListener('DOMContentLoaded', function(){
+    try{ var v=document.querySelector('video'); if(v){ v.muted=true; v.play&&v.play().catch(function(){}); } }catch(e){}
+  });
+})();
+""";
 func axVideoIdSwift(_ s: String) -> String? {
     if s.count == 11, s.range(of: "^[A-Za-z0-9_-]{11}$", options: .regularExpression) != nil { return s }
     guard let u = URL(string: s) else { return nil }
